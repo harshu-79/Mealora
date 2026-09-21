@@ -1,0 +1,15 @@
+Mealora ML Progress
+
+Recipe feature matrix: 18,568 x 15,140
+Content-based recommendation: implemented
+Collaborative filtering: implemented
+Hybrid recommendation: implemented
+Pantry compatibility: implemented
+Expiry-aware scoring: implemented
+Context scoring: implemented
+Final Top-2 ranking: implemented
+
+Evaluation:
+Prototype pipeline created.
+Current demo interaction set is too small for meaningful metrics.
+Proper train/test evaluation with larger interaction data is pending.

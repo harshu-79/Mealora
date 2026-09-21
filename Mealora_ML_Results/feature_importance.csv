@@ -1,0 +1,11 @@
+Feature,Importance
+ingredient_count,0.5355063659074369
+cooking_time_minutes,0.2032601605208157
+context_score,0.07913312396584421
+diet_match,0.056705526129361
+meal_match,0.05289443664373637
+cuisine_match,0.04469919466989109
+time_match,0.027801192162914594
+pantry_match_pct,0.0
+missing_ingredient_count,0.0
+expiry_score,0.0

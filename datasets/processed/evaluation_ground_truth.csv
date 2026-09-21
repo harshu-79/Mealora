@@ -1,0 +1,10 @@
+user_id,recipe_id,rating,interaction
+1,2,5,cooked
+1,4,4,saved
+1,8,5,liked
+2,2,4,liked
+2,9,5,cooked
+2,12,3,saved
+3,4,5,cooked
+3,8,4,liked
+3,12,5,cooked

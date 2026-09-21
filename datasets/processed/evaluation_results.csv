@@ -1,0 +1,2 @@
+model,Precision@2,Recall@2,Hit Rate@2
+Collaborative Filtering,0.1667,0.3333,0.3333

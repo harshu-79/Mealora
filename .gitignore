@@ -1,0 +1,36 @@
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env.local
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+build/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.log
+.ipynb_checkpoints/
+mealora_backup_before_explainability_20260831_233356/
+mealora_backup_before_explainability_20260831_233818/
+
+# Large raw datasets
+datasets/raw/en.openfoodfacts.org.products.tsv
+datasets/raw/recipes.csv
+datasets/raw/upc_corpus 2.csv
+
+# Large generated datasets
+datasets/processed/master_grocery_vocabulary.csv
+datasets/processed/openfoodfacts_cleaned.csv
+datasets/processed/mealora_grocery_vocabulary.csv
+datasets/processed/mealora_grocery_vocabulary_clean.csv
+datasets/processed/recipe_master_dataset.csv
+datasets/processed/recipes_master_cleaned.csv
+
+# Generated feature matrices
+datasets/processed/*.npz
+datasets/processed/*.joblib

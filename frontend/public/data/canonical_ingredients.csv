@@ -1,0 +1,128 @@
+canonical_name,alias,normalized_alias,category
+onion,onion,onion,vegetables
+onion,onions,onions,vegetables
+onion,onion loose,onion loose,vegetables
+onion,shallot,shallot,vegetables
+onion,shallots,shallots,vegetables
+onion,pyaz,pyaz,vegetables
+tomato,tomato,tomato,vegetables
+tomato,tomatoes,tomatoes,vegetables
+tomato,tomato loose,tomato loose,vegetables
+tomato,tamatar,tamatar,vegetables
+potato,potato,potato,vegetables
+potato,potatoes,potatoes,vegetables
+potato,russet potato,russet potato,vegetables
+potato,baby potato,baby potato,vegetables
+potato,aloo,aloo,vegetables
+sweet potato,sweet potato,sweet potato,vegetables
+sweet potato,sweet potatoes,sweet potatoes,vegetables
+sweet potato,shakarkandi,shakarkandi,vegetables
+carrot,carrot,carrot,vegetables
+carrot,carrots,carrots,vegetables
+carrot,gajar,gajar,vegetables
+spinach,spinach,spinach,vegetables
+spinach,palak,palak,vegetables
+cabbage,cabbage,cabbage,vegetables
+cauliflower,cauliflower,cauliflower,vegetables
+cauliflower,gobi,gobi,vegetables
+brinjal,brinjal,brinjal,vegetables
+brinjal,brinjals,brinjals,vegetables
+brinjal,eggplant,eggplant,vegetables
+brinjal,baingan,baingan,vegetables
+capsicum,capsicum,capsicum,vegetables
+capsicum,bell pepper,bell pepper,vegetables
+capsicum,bell peppers,bell peppers,vegetables
+green chilli,green chilli,green chilli,vegetables
+green chilli,green chillies,green chillies,vegetables
+green chilli,green chili,green chili,vegetables
+green chilli,green chilies,green chilies,vegetables
+green chilli,hari mirch,hari mirch,vegetables
+ginger,ginger,ginger,vegetables
+ginger,adrak,adrak,vegetables
+garlic,garlic,garlic,vegetables
+garlic,lehsun,lehsun,vegetables
+cucumber,cucumber,cucumber,vegetables
+cucumber,cucumbers,cucumbers,vegetables
+cucumber,kheera,kheera,vegetables
+apple,apple,apple,fruits
+apple,apples,apples,fruits
+banana,banana,banana,fruits
+banana,bananas,bananas,fruits
+banana,kela,kela,fruits
+orange,orange,orange,fruits
+orange,oranges,oranges,fruits
+orange,santra,santra,fruits
+mango,mango,mango,fruits
+mango,mangoes,mangoes,fruits
+mango,aam,aam,fruits
+lemon,lemon,lemon,fruits
+lemon,lemons,lemons,fruits
+lemon,nimbu,nimbu,fruits
+rice,rice,rice,grains
+rice,raw rice,raw rice,grains
+rice,basmati rice,basmati rice,grains
+rice,sona masuri,sona masuri,grains
+rice,rice grain,rice grain,grains
+wheat flour,wheat flour,wheat flour,grains
+wheat flour,atta,atta,grains
+wheat flour,whole wheat flour,whole wheat flour,grains
+wheat flour,gehun atta,gehun atta,grains
+rava,rava,rava,grains
+rava,sooji,sooji,grains
+rava,semolina,semolina,grains
+oats,oats,oats,grains
+oats,oat,oat,grains
+toor dal,toor dal,toor dal,pulses
+toor dal,arhar dal,arhar dal,pulses
+toor dal,tuvar dal,tuvar dal,pulses
+toor dal,pigeon pea,pigeon pea,pulses
+moong dal,moong dal,moong dal,pulses
+moong dal,mung dal,mung dal,pulses
+moong dal,green gram,green gram,pulses
+chana dal,chana dal,chana dal,pulses
+chana dal,split chickpeas,split chickpeas,pulses
+urad dal,urad dal,urad dal,pulses
+urad dal,black gram,black gram,pulses
+milk,milk,milk,dairy
+milk,cow milk,cow milk,dairy
+milk,full cream milk,full cream milk,dairy
+milk,toned milk,toned milk,dairy
+curd,curd,curd,dairy
+curd,yogurt,yogurt,dairy
+curd,yoghurt,yoghurt,dairy
+curd,dahi,dahi,dairy
+paneer,paneer,paneer,dairy
+paneer,cottage cheese,cottage cheese,dairy
+butter,butter,butter,dairy
+cheese,cheese,cheese,dairy
+egg,egg,egg,protein
+egg,eggs,eggs,protein
+chicken,chicken,chicken,protein
+chicken,chicken breast,chicken breast,protein
+chicken,chicken breasts,chicken breasts,protein
+fish,fish,fish,protein
+bread,bread,bread,bakery
+bread,loaf,loaf,bakery
+bread,loaves,loaves,bakery
+sugar,sugar,sugar,staples
+sugar,brown sugar,brown sugar,staples
+sugar,palm sugar,palm sugar,staples
+sugar,jaggery,jaggery,staples
+sugar,gur,gur,staples
+salt,salt,salt,spices
+salt,table salt,table salt,spices
+cooking oil,cooking oil,cooking oil,staples
+cooking oil,vegetable oil,vegetable oil,staples
+cooking oil,sunflower oil,sunflower oil,staples
+cooking oil,groundnut oil,groundnut oil,staples
+ghee,ghee,ghee,dairy
+red chilli powder,red chilli powder,red chilli powder,spices
+red chilli powder,chilli powder,chilli powder,spices
+red chilli powder,chili powder,chili powder,spices
+turmeric powder,turmeric,turmeric,spices
+turmeric powder,turmeric powder,turmeric powder,spices
+turmeric powder,haldi,haldi,spices
+cumin,cumin,cumin,spices
+cumin,jeera,jeera,spices
+coriander powder,coriander powder,coriander powder,spices
+coriander powder,dhaniya powder,dhaniya powder,spices

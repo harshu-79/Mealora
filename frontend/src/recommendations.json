@@ -1,0 +1,20 @@
+[
+  {
+    "recipe_id": 15632,
+    "recipe_name": "Delicious Dal Makhani Recipe Without Onion and Garlic (Jain)",
+    "cuisine": "north indian",
+    "meal_type": "Lunch",
+    "image_url": "https://www.archanaskitchen.com/images/archanaskitchen/1-Author/Riya/Delicious_Dal_Makhani_Recipe_without_Onion_and_garlic_-1.jpg",
+    "diet_type": "High Protein Vegetarian",
+    "difficulty": "Hard"
+  },
+  {
+    "recipe_id": 16565,
+    "recipe_name": "Andhra Style Erra Kaaram Dosa Recipe (Spicy Red Chilli Chutney Dosa Recipe)",
+    "cuisine": "andhra",
+    "meal_type": "Breakfast",
+    "image_url": "https://www.archanaskitchen.com/images/archanaskitchen/1-Author/sibyl_sunitha/Andhra_Style_Erra_Kaaram_Dosa_Recipe_Spicy_Red_Chilli_Chutney_Dosa_Recipe.jpg",
+    "diet_type": "Vegetarian",
+    "difficulty": "Hard"
+  }
+]

@@ -1,0 +1,32 @@
+======================================================================
+MEALORA 5-FOLD CROSS-VALIDATION RESULTS
+======================================================================
+
+Dataset samples: 13068
+Number of folds: 5
+Number of features: 10
+
+FEATURES USED:
+- pantry_match_pct
+- missing_ingredient_count
+- expiry_score
+- meal_match
+- diet_match
+- cuisine_match
+- time_match
+- context_score
+- ingredient_count
+- cooking_time_minutes
+
+======================================================================
+MODEL COMPARISON
+======================================================================
+
+               model  accuracy_mean  accuracy_std  precision_mean  precision_std  recall_mean  recall_std  f1_mean   f1_std  roc_auc_mean  roc_auc_std
+HistGradientBoosting       0.999235      0.000872        0.999050       0.001471     0.999049    0.001204 0.999049 0.001084      0.999988     0.000018
+       Random Forest       0.999235      0.000802        0.999810       0.000381     0.998287    0.002032 0.999047 0.001001      0.999996     0.000005
+         Naive Bayes       0.957912      0.003684        0.922634       0.007250     0.977355    0.002911 0.949191 0.004258      0.981813     0.002017
+
+======================================================================
+BEST MODEL BASED ON MEAN F1 SCORE: HistGradientBoosting
+======================================================================

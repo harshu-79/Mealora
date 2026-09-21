@@ -1,0 +1,10 @@
+1.
+recipe_master_dataset.csv
+ (to open the dataset)
+
+ 2.
+ python3 notebooks/final_ranker.py
+(Top 2 recipes + component scores)
+
+3.
+user_recipe_interactions.csv

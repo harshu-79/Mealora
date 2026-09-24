@@ -709,6 +709,218 @@ def recommendations():
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
+
+# ============================================================
+# LEFTOVER INTELLIGENCE
+# ============================================================
+# Reuse-first logic: search the same Mealora recipe dataset for
+# recipes whose ingredient list contains the reported leftover.
+# This is a lightweight ingredient-compatibility algorithm, not
+# a second recipe recommender that replaces the main ML engine.
+# ============================================================
+
+def _leftover_tokens(value):
+    import re
+    stop = {
+        "leftover", "leftovers", "cooked", "cooking", "food", "some",
+        "the", "and", "with", "of", "a", "an", "to", "from"
+    }
+    text = _normalize_lookup_text(value)
+    return {x for x in text.split() if len(x) >= 3 and x not in stop}
+
+
+def _ingredient_column(df):
+    return _recipe_column(df, [
+        "ingredients", "ingredient_names", "ingredient_list",
+        "Cleaned-Ingredients", "TranslatedIngredients"
+    ])
+
+
+def _recipe_name_column(df):
+    return _recipe_column(df, ["recipe_name", "name", "title", "final_food_name"])
+
+
+def _leftover_recommendations(leftover, top_k=6):
+    import pandas as pd
+    import re
+
+    if not os.path.exists(RECIPE_DATASET):
+        raise FileNotFoundError(f"Recipe dataset not found: {RECIPE_DATASET}")
+
+    df = pd.read_csv(RECIPE_DATASET, low_memory=False)
+    name_col = _recipe_name_column(df)
+    ing_col = _ingredient_column(df)
+    id_col = _recipe_column(df, ["recipe_id", "id"])
+
+    if not name_col or not ing_col:
+        raise RuntimeError("Recipe dataset does not contain recipe name and ingredient columns.")
+
+    leftover_tokens = _leftover_tokens(leftover)
+    if not leftover_tokens:
+        return []
+
+    results = []
+    for idx, row in df[[name_col, ing_col] + ([id_col] if id_col else [])].iterrows():
+        raw = str(row[ing_col]) if row[ing_col] == row[ing_col] else ""
+        if not raw:
+            continue
+
+        ingredient_text = _normalize_lookup_text(raw)
+        ingredient_tokens = set(ingredient_text.split())
+        if not ingredient_tokens:
+            continue
+
+        # Whole leftover phrase gets the strongest signal.
+        normalized_leftover = _normalize_lookup_text(leftover)
+        phrase_match = normalized_leftover and normalized_leftover in ingredient_text
+        token_matches = leftover_tokens.intersection(ingredient_tokens)
+
+        # Also allow singular/plural and simple Indian ingredient wording.
+        expanded_matches = set(token_matches)
+        for token in leftover_tokens:
+            if token.endswith("s") and token[:-1] in ingredient_tokens:
+                expanded_matches.add(token[:-1])
+            elif f"{token}s" in ingredient_tokens:
+                expanded_matches.add(f"{token}s")
+
+        if not phrase_match and not expanded_matches:
+            continue
+
+        token_score = len(expanded_matches) / max(len(leftover_tokens), 1)
+        score = 0.75 * token_score + (0.25 if phrase_match else 0.0)
+        if score <= 0:
+            continue
+
+        name = str(row[name_col]).strip()
+        if not name:
+            continue
+
+        # Prefer recipes where the leftover appears as an ingredient phrase,
+        # then by the number of matched leftover terms.
+        results.append({
+            "recipe_id": str(row[id_col]) if id_col else str(idx),
+            "recipe_name": name,
+            "match_score": round(min(score, 1.0), 4),
+            "matched_ingredients": sorted(expanded_matches),
+            "cuisine": str(row["cuisine"]).strip() if "cuisine" in df.columns and row["cuisine"] == row["cuisine"] else "",
+            "meal_type": str(row["meal_type"]).strip() if "meal_type" in df.columns and row["meal_type"] == row["meal_type"] else "",
+        })
+
+    results.sort(key=lambda x: (-x["match_score"], x["recipe_name"].lower()))
+
+    # Remove duplicate recipe names caused by multiple source records.
+    unique = []
+    seen = set()
+    for item in results:
+        key = _normalize_lookup_text(item["recipe_name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+        if len(unique) >= max(1, min(int(top_k), 20)):
+            break
+
+    return unique
+
+
+@app.route("/api/leftover-recommendations", methods=["POST"])
+def leftover_recommendations():
+    try:
+        import pandas as pd, re
+        data=request.get_json() or {}; leftover=str(data.get("leftover","")).strip().lower()
+        if not leftover: return jsonify({"success":False,"error":"Enter a leftover food or ingredient."}),400
+        df=pd.read_csv(RECIPE_DATASET,low_memory=False)
+        def pick(cols):
+            return next((c for c in cols if c in df.columns),None)
+        name_col=pick(["recipe_name","name","title","final_food_name"])
+        ing_col=pick(["ingredients","ingredient_names","ingredient_list","Cleaned-Ingredients","cleaned_ingredients","TranslatedIngredients","ingredients_clean"])
+        cuisine_col=pick(["cuisine","Cuisine","cuisine_type"])
+        if not name_col or not ing_col: raise RuntimeError("Recipe dataset does not contain recipe-name and ingredient columns.")
+        def tok(v): return {x for x in re.findall(r"[a-z0-9]+",str(v).lower()) if len(x)>2}
+        q=tok(leftover); rows=[]
+        for _,row in df.iterrows():
+            name=str(row.get(name_col,"") or ""); ing=str(row.get(ing_col,"") or ""); hay=(name+" "+ing).lower(); overlap=q & tok(hay)
+            if not overlap: continue
+            score=len(overlap)/max(len(q),1)
+            if leftover in hay: score+=.35
+            rows.append({"recipe_id":str(row.get("recipe_id",row.get("id",""))),"recipe_name":name,"ingredients":ing,"cuisine":str(row.get(cuisine_col,"") or "") if cuisine_col else "","match_score":round(min(score,1),4),"reason":f"Uses ingredients matching '{leftover}'."})
+        rows=sorted(rows,key=lambda x:x["match_score"],reverse=True)[:5]
+        return jsonify({"success":True,"leftover":leftover,"reuse_possible":bool(rows),"recommendations":rows,"donation_suggestion":not bool(rows)})
+    except Exception as e:
+        import traceback; traceback.print_exc(); return jsonify({"success":False,"error":str(e)}),500
+@app.route("/api/weekly-plan", methods=["POST"])
+def weekly_plan():
+    """Run the real 598-line Mealora NSGA-II planner and return its plan to React."""
+    try:
+        data = request.get_json() or {}
+
+        adults = max(0, int(data.get("household", {}).get("adults", 2)))
+        children = max(0, int(data.get("household", {}).get("children", 0)))
+        seniors = max(0, int(data.get("household", {}).get("seniors", 0)))
+        household_servings = max(1, adults + round(children * 0.6) + round(seniors * 0.8))
+
+        diet = str(data.get("diet", "Vegetarian") or "Vegetarian")
+        cuisine = str(data.get("cuisine", "South Indian") or "South Indian")
+        max_time = float(data.get("max_time", 60))
+
+        planner_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "notebooks", "weekly_meal_planner.py"
+        )
+
+        if not os.path.exists(planner_path):
+            return jsonify({
+                "success": False,
+                "error": "weekly_meal_planner.py was not found in notebooks."
+            }), 500
+
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mealora_weekly_planner", planner_path)
+        planner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(planner)
+
+        result = planner.generate_weekly_plan(
+            diet=diet,
+            cuisine=cuisine,
+            max_time=max_time,
+            household_servings=household_servings,
+        )
+
+        plan = result.get("plan", [])
+        grouped = []
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        for day in days:
+            meals = [row for row in plan if row.get("day") == day]
+            grouped.append({"day": day, "meals": meals})
+
+        objectives = result.get("objectives", {})
+        summary = {
+            "learned_suitability": round(objectives.get("Learned suitability", 0) * 100, 1),
+            "waste_reduction": round(objectives.get("Waste reduction", 0) * 100, 1),
+            "nutrition_balance": round(objectives.get("Nutrition balance", 0) * 100, 1),
+            "context_suitability": round(objectives.get("Context suitability", 0) * 100, 1),
+            "ingredient_reuse": round(objectives.get("Ingredient reuse", 0) * 100, 1),
+            "recipe_variety": round(objectives.get("Recipe variety", 0) * 100, 1),
+            "pareto_solutions": result.get("pareto_solutions", 0),
+            "household_servings": household_servings,
+            "diet": diet,
+            "cuisine": cuisine,
+            "max_time": max_time,
+        }
+
+        return jsonify({
+            "success": True,
+            "plan": grouped,
+            "summary": summary,
+            "algorithm": result.get("planning_algorithm"),
+            "ml_recommendation": result.get("ml_recommendation"),
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
 if __name__ == "__main__":
     print("=" * 60)
     print("MEALORA BACKEND API")

@@ -1,0 +1,124 @@
+import { useState } from "react";
+
+const API = "http://127.0.0.1:5000/api/weekly-plan";
+
+
+function averageMetric(plan, field) {
+  const values = (plan || [])
+    .flatMap((day) => day.meals || [])
+    .map((meal) => Number(meal[field]))
+    .filter((value) => Number.isFinite(value));
+
+  if (!values.length) return "0.0";
+  return (values.reduce((sum, value) => sum + value, 0) / values.length * 100).toFixed(1);
+}
+
+function uniqueRecipeCount(plan) {
+  const names = (plan || [])
+    .flatMap((day) => day.meals || [])
+    .map((meal) => meal.recipe_name)
+    .filter(Boolean);
+  return new Set(names).size;
+}
+
+
+export default function WeeklyMealPlanner({ pantryItems = [] }) {
+  const [adults, setAdults] = useState(2);
+  const [children, setChildren] = useState(0);
+  const [seniors, setSeniors] = useState(0);
+  const [diet, setDiet] = useState("Mixed");
+  const [maxTime, setMaxTime] = useState(45);
+  const [plan, setPlan] = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function generatePlan(event) {
+    event?.preventDefault();
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pantry: pantryItems,
+          household: { adults, children, seniors },
+          diet,
+          max_time: Number(maxTime),
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || "Unable to generate weekly plan.");
+      }
+      setPlan(data.plan || []);
+      setSummary(data.summary || null);
+    } catch (err) {
+      console.error("Weekly planner error:", err);
+      setError(err.message || "Unable to generate weekly plan.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 22 }}>
+        <h2 style={{ margin: 0 }}>📅 Weekly Meal Planner</h2>
+        <p style={{ marginTop: 8, color: "#64748b" }}>
+          Mealora builds a 7-day meal plan by balancing pantry usage, expiry, nutrition,
+          cooking time, preferences and recipe variety.
+        </p>
+      </div>
+
+      <form onSubmit={generatePlan} style={{ padding: 20, borderRadius: 16, background: "#f8fafc", border: "1px solid #e2e8f0" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
+          <label>Adults<input type="number" min="0" value={adults} onChange={(e) => setAdults(e.target.value)} /></label>
+          <label>Children<input type="number" min="0" value={children} onChange={(e) => setChildren(e.target.value)} /></label>
+          <label>Seniors<input type="number" min="0" value={seniors} onChange={(e) => setSeniors(e.target.value)} /></label>
+          <label>Diet<select value={diet} onChange={(e) => setDiet(e.target.value)}><option>Mixed</option><option>Vegetarian</option><option>Non-Vegetarian</option></select></label>
+          <label>Max cooking time<select value={maxTime} onChange={(e) => setMaxTime(e.target.value)}><option value="30">30 min</option><option value="45">45 min</option><option value="60">60 min</option><option value="90">90 min</option></select></label>
+        </div>
+
+        <button type="submit" className="primary-button" disabled={loading} style={{ marginTop: 18, width: "100%" }}>
+          {loading ? "⏳ Optimizing 7-day plan..." : "✨ Generate Weekly Plan"}
+        </button>
+      </form>
+
+      {error && <div style={{ marginTop: 16, padding: 14, borderRadius: 12, background: "#fff1f2", color: "#b91c1c", border: "1px solid #fecdd3" }}>{error}</div>}
+
+      {summary && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, marginTop: 18 }}>
+          <div className="section-card"><small>Pantry utilization</small><strong>{summary.pantry_utilization}%</strong></div>
+          <div className="section-card"><small>Expiry reduction</small><strong>{summary.expiry_focus}%</strong></div>
+          <div className="section-card"><small>Recipe variety</small><strong>{summary.unique_recipes}</strong></div>
+          <div className="section-card"><small>Meals planned</small><strong>{plan.length}</strong></div>
+        </div>
+      )}
+
+      {plan.length > 0 && (
+        <div style={{ marginTop: 22, display: "grid", gap: 14 }}>
+          {(plan || []).map((day) => (
+            <div key={day.day} style={{ padding: 18, borderRadius: 16, border: "1px solid #e2e8f0", background: "#fff" }}>
+              <h3 style={{ margin: "0 0 14px" }}>{day.day}</h3>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+                {(day.meals || []).map((meal) => (
+                  <div key={`${day.day}-${meal.meal || meal.meal_type || "meal"}`} style={{ padding: 14, borderRadius: 12, background: "#f8fafc" }}>
+                    <div style={{ fontSize: 12, color: "#64748b", fontWeight: 700 }}>{String(meal.meal || meal.meal_type || "Meal").toUpperCase()}</div>
+                    <strong style={{ display: "block", marginTop: 5 }}>{meal.recipe_name}</strong>
+                    <div style={{ marginTop: 8, fontSize: 13, color: "#64748b" }}>
+                      Mealora score: {Number(meal.mealora_score ?? meal.optimization_score ?? 0).toFixed(3)} · RF: {Number(meal.rf_suitability_score ?? 0).toFixed(2)} · HAN: {Number(meal.han_score ?? 0).toFixed(2)}
+                    </div>
+                    <div style={{ marginTop: 7, fontSize: 13 }}>{meal.reason}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

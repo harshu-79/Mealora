@@ -39,17 +39,23 @@ INTERACTIONS = os.path.join(
     "user_recipe_interactions.csv"
 )
 
-HGB_MODEL = os.path.join(
+RF_MODEL_CANDIDATES = [
+    os.path.join(BASE, "mealora_rf_model.joblib"),
+    os.path.join(BASE, "mealora_ml_models", "mealora_selected_ml_model.joblib"),
+]
+
+HAN_SCORES = os.path.join(
     BASE,
-    "mealora_hgb_model.joblib"
+    "han_model",
+    "han_recipe_scores.csv"
 )
 
 
 # ============================================================
-# HGB FEATURES
+# RANDOM FOREST FEATURES
 # ============================================================
 
-HGB_FEATURES = [
+RF_FEATURES = [
     "pantry_match_pct",
     "missing_ingredient_count",
     "expiry_score",
@@ -64,47 +70,45 @@ HGB_FEATURES = [
 
 
 # ============================================================
-# LOAD HGB MODEL
+# LOAD RANDOM FOREST MODEL
 # ============================================================
 
-print("\nLoading Mealora data...")
+print("\nLoading Mealora ML model...")
 
-saved_object = joblib.load(HGB_MODEL)
+RF_FEATURES = [
+    "pantry_match_pct",
+    "missing_ingredient_count",
+    "expiry_score",
+    "meal_match",
+    "diet_match",
+    "cuisine_match",
+    "time_match",
+    "context_score",
+    "ingredient_count",
+    "cooking_time_minutes",
+]
 
-print(
-    "Saved HGB object type:",
-    type(saved_object)
-)
+try:
+    RF_MODEL = next((path for path in RF_MODEL_CANDIDATES if os.path.exists(path)), RF_MODEL_CANDIDATES[0])
+    saved_object = joblib.load(RF_MODEL)
+except Exception as exc:
+    saved_object = None
+    print("RF model could not be loaded at import time:", exc)
 
 if isinstance(saved_object, dict):
-
-    print(
-        "Saved HGB object is a dictionary."
-    )
-
-    print(
-        "Dictionary keys:",
-        list(saved_object.keys())
-    )
-
-    if "model" not in saved_object:
-        raise ValueError(
-            "HGB dictionary does not contain 'model'."
-        )
-
-    hgb_model = saved_object["model"]
-
-    print(
-        "HGB model found under key: 'model'"
-    )
-
+    rf_model = saved_object.get("model")
+    rf_features = saved_object.get("features", RF_FEATURES)
+    rf_model_name = saved_object.get("model_name", "Random Forest")
 else:
+    rf_model = saved_object
+    rf_features = RF_FEATURES
+    rf_model_name = "Random Forest"
 
-    hgb_model = saved_object
-
-    print(
-        "HGB model loaded directly."
-    )
+if rf_model is not None:
+    print("Loaded selected ML model:", rf_model_name)
+    print("RF ranking features:", rf_features)
+else:
+    print("WARNING: Random Forest model is unavailable. Candidate ranking will use base score until the model is trained.")
 
 
 # ============================================================
@@ -410,6 +414,29 @@ def recommend(
     )
 
     # --------------------------------------------------------
+    # MERGE HAN GRAPH SCORES
+    # --------------------------------------------------------
+    original_recipe_count = len(df)
+    if os.path.exists(HAN_SCORES):
+        print("\nMerging HAN graph scores...")
+        han = pd.read_csv(HAN_SCORES, low_memory=False)
+        if "recipe_id" in df.columns and "recipe_id" in han.columns:
+            han_small = han[["recipe_id", "han_score"]].drop_duplicates("recipe_id")
+            df = df.merge(han_small, on="recipe_id", how="left", validate="one_to_one")
+        elif "recipe_name" in df.columns and "recipe_name" in han.columns:
+            han_small = han[["recipe_name", "han_score"]].drop_duplicates("recipe_name")
+            df = df.merge(han_small, on="recipe_name", how="left", validate="many_to_one")
+        else:
+            df["han_score"] = 0.5
+        if len(df) != original_recipe_count:
+            raise RuntimeError("HAN merge changed the recipe count. Duplicate recipe rows were created.")
+        df["han_score"] = pd.to_numeric(df["han_score"], errors="coerce").fillna(0.5).clip(0, 1)
+        print("HAN scores merged:", len(han))
+    else:
+        df["han_score"] = 0.5
+        print("WARNING: HAN score file not found. Using neutral HAN score 0.5.")
+
+    # --------------------------------------------------------
     # MERGE PANTRY FEATURES
     # --------------------------------------------------------
 
@@ -508,160 +535,61 @@ def recommend(
     df["content_score"] = content_scores
 
     # ========================================================
-    # 2. COLLABORATIVE FILTERING
+    # 2. PERSONAL BEHAVIOUR LEARNING
     # ========================================================
 
     print(
-        "Calculating collaborative filtering..."
+        "Calculating personal behaviour score..."
     )
 
-    # --------------------------------------------------------
-    # Interaction weights
-    # --------------------------------------------------------
-
     interaction_weights = {
-        "cooked": 5,
-        "liked": 4,
-        "saved": 3,
-        "skipped": 1,
-        "disliked": 0,
+        "cooked": 1.00,
+        "liked": 0.85,
+        "saved": 0.70,
+        "skipped": 0.20,
+        "disliked": 0.00,
     }
+
+    if "interaction" not in interactions.columns:
+        interactions["interaction"] = ""
 
     interactions["preference"] = (
         interactions["interaction"]
+        .astype(str)
+        .str.lower()
         .map(interaction_weights)
     )
 
-    # Use rating when interaction is unknown
-    interactions["preference"] = (
-        interactions["preference"]
-        .fillna(
-            pd.to_numeric(
-                interactions["rating"],
-                errors="coerce"
-            )
+    if "rating" in interactions.columns:
+        interactions["preference"] = interactions["preference"].fillna(
+            pd.to_numeric(interactions["rating"], errors="coerce") / 5.0
         )
-        .fillna(0)
+
+    interactions["preference"] = interactions["preference"].fillna(0).clip(0, 1)
+
+    personal = (
+        interactions[interactions["user_id"] == target_user]
+        .groupby("recipe_id")["preference"]
+        .mean()
+        if "user_id" in interactions.columns and "recipe_id" in interactions.columns
+        else pd.Series(dtype=float)
     )
 
-    # --------------------------------------------------------
-    # User-recipe preference matrix
-    # --------------------------------------------------------
+    if len(personal) > 0 and personal.max() > 0:
+        personal = personal / personal.max()
 
-    matrix = interactions.pivot_table(
-        index="user_id",
-        columns="recipe_id",
-        values="preference",
-        aggfunc="mean",
-        fill_value=0
-    )
-
-    collaborative = {}
-
-    if target_user in matrix.index:
-
-        # ----------------------------------------------------
-        # User similarity
-        # ----------------------------------------------------
-
-        user_similarity = cosine_similarity(
-            matrix
-        )
-
-        similarity_df = pd.DataFrame(
-            user_similarity,
-            index=matrix.index,
-            columns=matrix.index
-        )
-
-        neighbors = (
-            similarity_df.loc[target_user]
-            .drop(target_user)
-            .sort_values(
-                ascending=False
-            )
-        )
-
-        # ----------------------------------------------------
-        # Generate recommendations from similar users
-        # ----------------------------------------------------
-
-        target_history = set(
-            interactions[
-                interactions["user_id"] == target_user
-            ]["recipe_id"]
-        )
-
-        for neighbor, similarity in neighbors.items():
-
-            if similarity <= 0:
-                continue
-
-            neighbor_preferences = matrix.loc[
-                neighbor
-            ]
-
-            for recipe_id, preference in (
-                neighbor_preferences.items()
-            ):
-
-                # Skip recipes already used
-                # by target user
-                if recipe_id in target_history:
-                    continue
-
-                if preference <= 0:
-                    continue
-
-                score = (
-                    similarity * preference
-                )
-
-                collaborative[recipe_id] = (
-                    collaborative.get(
-                        recipe_id,
-                        0
-                    )
-                    + score
-                )
-
-    # --------------------------------------------------------
-    # Normalize collaborative scores
-    # --------------------------------------------------------
-
-    max_collaborative = max(
-        collaborative.values(),
-        default=0
-    )
-
-    if max_collaborative > 0:
-
-        collaborative = {
-            recipe_id:
-            score / max_collaborative
-
-            for recipe_id, score
-            in collaborative.items()
-        }
-
-    # --------------------------------------------------------
-    # Map CF scores to master dataset
-    # --------------------------------------------------------
-
-    df["collaborative_score"] = (
-        df["recipe_id"]
-        .map(collaborative)
-        .fillna(0)
+    df["personal_behavior_score"] = (
+        df["recipe_id"].map(personal).fillna(0).clip(0, 1)
     )
 
     # ========================================================
-    # 3. HYBRID CONTENT + COLLABORATIVE
+    # 3. HYBRID CONTENT + PERSONAL BEHAVIOUR
     # ========================================================
 
     df["hybrid_score"] = (
-        0.60 * df["content_score"]
+        0.70 * df["content_score"]
         +
-        0.40 * df["collaborative_score"]
+        0.30 * df["personal_behavior_score"]
     )
 
     # ========================================================
@@ -747,7 +675,11 @@ def recommend(
 
     # Normalize text safely
     meal_text = df["meal_type"].fillna("").astype(str).str.lower().str.strip()
-    diet_text = df["diet_type"].fillna("").astype(str).str.lower().str.strip()
+    diet_column = "diet_type" if "diet_type" in df.columns else ("diet" if "diet" in df.columns else None)
+    if diet_column is None:
+        df["diet_type"] = ""
+        diet_column = "diet_type"
+    diet_text = df[diet_column].fillna("").astype(str).str.lower().str.strip()
     cuisine_text = df["cuisine"].fillna("").astype(str).str.lower().str.strip()
 
     requested_meal = context["meal_type"].lower()
@@ -908,92 +840,71 @@ def recommend(
     )
 
     # ========================================================
-    # 7. HISTGRADIENTBOOSTING SUITABILITY
+    # NUTRITION SCORE
     # ========================================================
+    # Only recipes with real nutrition values are scored. Missing
+    # nutrition is neutral and never treated as zero nutrition.
+    nutrition_cols = {
+        "calories": ["calories", "Calories (kcal)"],
+        "protein": ["protein", "Protein (g)"],
+        "carbohydrates": ["carbohydrates", "Carbohydrates (g)"],
+        "fat": ["fat", "Fats (g)"],
+        "fibre": ["fibre", "Fibre (g)"],
+    }
 
-    print(
-        "\nRunning HistGradientBoosting "
-        "suitability model..."
-    )
+    def _find_col(options):
+        for c in options:
+            if c in df.columns:
+                return c
+        return None
 
-    # --------------------------------------------------------
-    # Prepare HGB input
-    # --------------------------------------------------------
-
-    hgb_input = pd.DataFrame(
-        index=df.index
-    )
-
-    for feature in HGB_FEATURES:
-
-        if feature in df.columns:
-
-            hgb_input[feature] = (
-                pd.to_numeric(
-                    df[feature],
-                    errors="coerce"
-                )
-                .fillna(0)
-            )
-
+    nmap = {k: _find_col(v) for k, v in nutrition_cols.items()}
+    nutrition_available = pd.Series(True, index=df.index)
+    for c in nmap.values():
+        if c is not None:
+            nutrition_available &= pd.to_numeric(df[c], errors="coerce").notna()
         else:
+            nutrition_available &= False
 
-            print(
-                f"WARNING: Missing feature "
-                f"'{feature}'. Using 0."
-            )
+    df["nutrition_available"] = nutrition_available.astype(float)
+    df["nutrition_score"] = 0.5
 
-            hgb_input[feature] = 0.0
+    if nutrition_available.any():
+        valid = df.loc[nutrition_available].copy()
 
-    # Ensure exact feature order
-    hgb_input = hgb_input[
-        HGB_FEATURES
-    ]
+        def _norm_col(key):
+            c = nmap[key]
+            x = pd.to_numeric(valid[c], errors="coerce")
+            if x.max() == x.min():
+                return pd.Series(0.5, index=valid.index)
+            return ((x - x.min()) / (x.max() - x.min())).clip(0, 1).fillna(0.5)
 
-    print(
-        "HGB input shape:",
-        hgb_input.shape
-    )
-
-    # --------------------------------------------------------
-    # Prediction
-    # --------------------------------------------------------
-
-    hgb_probability = (
-        hgb_model
-        .predict_proba(
-            hgb_input
-        )[:, 1]
-    )
-
-    df["hgb_suitability_score"] = (
-        hgb_probability
-    )
+        protein_n = _norm_col("protein")
+        fibre_n = _norm_col("fibre")
+        calories = pd.to_numeric(valid[nmap["calories"]], errors="coerce")
+        fat = pd.to_numeric(valid[nmap["fat"]], errors="coerce")
+        cal_med = calories.median()
+        fat_med = fat.median()
+        cal_dev = (calories - cal_med).abs()
+        fat_dev = (fat - fat_med).abs()
+        calorie_score = 1 - (cal_dev / cal_dev.max()).replace([np.inf, -np.inf], np.nan).fillna(0.5) if cal_dev.max() else pd.Series(0.5, index=valid.index)
+        fat_score = 1 - (fat_dev / fat_dev.max()).replace([np.inf, -np.inf], np.nan).fillna(0.5) if fat_dev.max() else pd.Series(0.5, index=valid.index)
+        df.loc[valid.index, "nutrition_score"] = (
+            0.35 * protein_n + 0.30 * fibre_n + 0.20 * calorie_score + 0.15 * fat_score
+        ).clip(0, 1)
 
     print(
-        "HGB suitability prediction completed."
+        "Nutrition coverage in current recipes:",
+        f"{int(df['nutrition_available'].sum())}/{len(df)}",
+        f"({100 * df['nutrition_available'].mean():.2f}%)"
     )
 
     # ========================================================
-    # 8. FINAL WEIGHTED RANKING
+    # 7. MULTI-FACTOR CANDIDATE FILTER
     # ========================================================
-
-    # Context is deliberately stronger now so that changing
-    # meal type, diet, cuisine or time changes the ranking.
-    df["final_score"] = (
-        0.25 * df["hybrid_score"]
-        + 0.20 * df["pantry_score"]
-        + 0.10 * df["expiry_score"]
-        + 0.20 * df["context_score"]
-        + 0.05 * df["time_match"]
-        + 0.15 * df["hgb_suitability_score"]
-        + 0.03 * df["weather_score"]
-        + 0.02 * df["festival_score"]
-    )
-
-    # ========================================================
-    # CONTEXT-AWARE CANDIDATE FILTER
-    # ========================================================
+    # IMPORTANT: Random Forest is NOT used to search all 18,568
+    # recipes. The recommendation signals first create an eligible
+    # candidate pool. RF then reranks only that filtered pool.
 
     if "recipe_scope" in df.columns:
         result = df[
@@ -1003,97 +914,89 @@ def recommend(
     else:
         result = df[df.index != ref_idx].copy()
 
-    # Apply hard constraints only when they produce candidates.
-    # This prevents obviously incompatible recipes from dominating
-    # while still allowing graceful fallback for sparse metadata.
-
     def apply_constraint(current, mask, label):
-        filtered = current[mask.loc[current.index]]
-        if len(filtered) >= max(top_k, 5):
-            print(f"Hard filter applied: {label} -> {len(filtered)} candidates")
+        filtered = current[mask.loc[current.index]].copy()
+        minimum = max(top_k, 5)
+        if len(filtered) >= minimum:
+            print(f"Candidate filter applied: {label} -> {len(filtered)}")
             return filtered
-        print(f"Hard filter skipped: {label} (only {len(filtered)} candidates)")
+        print(f"Candidate filter relaxed: {label} (only {len(filtered)} candidates)")
         return current
 
-    # Meal type is highly relevant to the user request.
+    # All existing recommendation factors participate before RF.
     if requested_meal:
-        result = apply_constraint(
-            result,
-            df["meal_match"].eq(1),
-            "meal type"
-        )
-
-    # Diet should be respected strongly.
+        result = apply_constraint(result, df["meal_match"].eq(1), "meal type")
     if requested_diet:
-        result = apply_constraint(
-            result,
-            df["diet_match"].eq(1),
-            "diet"
-        )
-
-    # Cuisine should influence the pool when enough recipes exist.
+        result = apply_constraint(result, df["diet_match"].eq(1), "diet")
     if requested_cuisine:
-        result = apply_constraint(
-            result,
-            df["cuisine_match"].eq(1),
-            "cuisine"
-        )
+        result = apply_constraint(result, df["cuisine_match"].eq(1), "cuisine")
+    result = apply_constraint(result, df["time_match"].eq(1), "maximum cooking time")
 
-    # Maximum cooking time is a real user constraint.
-    result = apply_constraint(
-        result,
-        df["time_match"].eq(1),
-        "maximum cooking time"
-    )
+    # Pantry + expiry + contextual compatibility are soft-ranked
+    # within the eligible pool so sparse pantry data does not empty it.
+    result["candidate_base_score"] = (
+        0.25 * result["hybrid_score"]
+        + 0.25 * result["pantry_score"]
+        + 0.15 * result["expiry_score"]
+        + 0.15 * result["context_score"]
+        + 0.10 * result["nutrition_score"]
+        + 0.05 * result["time_match"]
+        + 0.03 * result["weather_score"]
+        + 0.02 * result["festival_score"]
+    ).clip(0, 1)
 
-    # --------------------------------------------------------
-    # Sort
-    # --------------------------------------------------------
-
-    result = (
-        result
-        .sort_values(
-            "final_score",
-            ascending=False
-        )
-        .head(top_k)
-    )
+    # Keep a bounded candidate pool. RF is the final supervised
+    # reranker, not the initial filter.
+    candidate_limit = max(100, top_k * 40)
+    result = result.sort_values(
+        ["candidate_base_score", "pantry_score", "expiry_score"],
+        ascending=False
+    ).head(candidate_limit).copy()
 
     # ========================================================
-    # AUTOMATIC MIXED-DIET DIVERSIFICATION
+    # 8. RANDOM FOREST FINAL RERANKING
     # ========================================================
-    if requested_diet in {"mixed", "mixed diet", "all"} and top_k >= 2:
-        nonveg_pattern = (
-            r"non.?vegetarian|nonveg|chicken|mutton|lamb|beef|pork|"
-            r"fish|prawn|shrimp|crab|meat|egg"
-        )
-        candidates = df.copy().sort_values("final_score", ascending=False)
-        diet_text_for_mix = candidates.get(
-            "diet_type", pd.Series("", index=candidates.index)
-        ).fillna("").astype(str)
-        name_text_for_mix = candidates.get(
-            "recipe_name", pd.Series("", index=candidates.index)
-        ).fillna("").astype(str)
-        is_nonveg = (
-            diet_text_for_mix.str.contains(nonveg_pattern, case=False, regex=True, na=False)
-            | name_text_for_mix.str.contains(nonveg_pattern, case=False, regex=True, na=False)
-        )
-        veg = candidates[~is_nonveg]
-        nonveg = candidates[is_nonveg]
-        selected = []
-        vi = ni = 0
-        for i in range(top_k):
-            if i % 2 == 1 and ni < len(nonveg):
-                selected.append(nonveg.iloc[ni])
-                ni += 1
-            elif vi < len(veg):
-                selected.append(veg.iloc[vi])
-                vi += 1
-            elif ni < len(nonveg):
-                selected.append(nonveg.iloc[ni])
-                ni += 1
-        if selected:
-            result = pd.DataFrame(selected)
+    if rf_model is not None:
+        rf_input = pd.DataFrame(index=result.index)
+        for feature in rf_features:
+            if feature in result.columns:
+                rf_input[feature] = pd.to_numeric(
+                    result[feature], errors="coerce"
+                ).fillna(0.0)
+            else:
+                rf_input[feature] = 0.0
+        rf_input = rf_input[rf_features]
+
+        try:
+            rf_probability = rf_model.predict_proba(rf_input)[:, 1]
+            result["rf_suitability_score"] = np.clip(
+                np.asarray(rf_probability, dtype=float), 0.0, 1.0
+            )
+        except Exception as exc:
+            print("RF reranking failed:", exc)
+            result["rf_suitability_score"] = result["candidate_base_score"]
+    else:
+        result["rf_suitability_score"] = result["candidate_base_score"]
+
+    # ========================================================
+    # 9. FINAL RF + HAN HYBRID RERANKING
+    # ========================================================
+    # RF and HAN operate on the SAME already-filtered candidate pool.
+    # They are final learned ranking signals, not broad candidate filters.
+    result["final_score"] = (
+        0.20 * result["content_score"]
+        + 0.15 * result["pantry_score"]
+        + 0.10 * result["expiry_score"]
+        + 0.10 * result["context_score"]
+        + 0.10 * result["nutrition_score"]
+        + 0.20 * result["rf_suitability_score"]
+        + 0.15 * result["han_score"]
+    ).clip(0, 1)
+
+    result = result.sort_values(
+        ["final_score", "rf_suitability_score", "han_score", "candidate_base_score"],
+        ascending=False
+    ).head(top_k).copy()
 
     # ========================================================
     # RETURN RESULTS
@@ -1104,7 +1007,7 @@ def recommend(
             "recipe_id",
             "recipe_name",
             "content_score",
-            "collaborative_score",
+            "personal_behavior_score",
             "hybrid_score",
             "pantry_score",
             "missing_ingredient_count",
@@ -1114,7 +1017,11 @@ def recommend(
             "weather_score",
             "festival_score",
             "location_score",
-            "hgb_suitability_score",
+            "rf_suitability_score",
+            "han_score",
+            "nutrition_score",
+            "nutrition_available",
+            "candidate_base_score",
             "final_score",
         ]
     ]
@@ -1176,13 +1083,15 @@ if __name__ == "__main__":
     print(
         "\n"
         "1. TF-IDF + Cosine Similarity\n"
-        "2. Collaborative Filtering\n"
-        "3. Hybrid Content + Collaborative Score\n"
+        "2. Personal Behaviour Learning\n"
+        "3. Hybrid Content + Personal Behaviour Score\n"
         "4. Pantry Compatibility\n"
         "5. Expiry / Food-Waste Score\n"
         "6. Context Score\n"
-        "7. HistGradientBoosting Suitability Prediction\n"
-        "8. Final Weighted Ranking"
+        "7. Multi-factor Candidate Filtering\n"
+        "8. Random Forest Final Reranking\n"
+        "9. HAN Graph Reranking\n"
+        "10. Nutrition-aware Hybrid Final Ranking"
     )
 
     print(

@@ -3,6 +3,8 @@ import { createWorker } from "tesseract.js";
 import { supabase } from "./supabaseClient";
 import { getPantryFeatures } from "./pantryFeatures";
 import { matchGroceryText } from "./ocrMatcher";
+import LeftoverDonation from "./LeftoverDonation";
+import WeeklyMealPlanner from "./WeeklyMealPlanner";
 import {
   preprocessImage,
   getOCRParameters,
@@ -732,7 +734,6 @@ function getRecommendationExplanation(recipe, contextInfo) {
   const pantry = Number(recipe.pantry_score || 0);
   const expiry = Number(recipe.expiry_score || 0);
   const content = Number(recipe.content_score || 0);
-  const collaborative = Number(recipe.collaborative_score || 0);
   const context = Number(recipe.context_score || 0);
   const time = Number(recipe.time_match || 0);
   const weather = Number(recipe.weather_score || 0);
@@ -801,9 +802,6 @@ function getRecommendationExplanation(recipe, contextInfo) {
     reasons.push("🔎 Strong recipe-content similarity");
   }
 
-  if (collaborative > 0.05) {
-    reasons.push("👥 Supported by user-preference signals");
-  }
 
   return reasons.slice(0, 4);
 }
@@ -2576,6 +2574,20 @@ function App() {
           onClick={() => setCurrentPage("recommendations")}
         >
           🍽️ Recommendations
+        </button>
+
+        <button
+          className={currentPage === "leftovers" ? "tab active" : "tab"}
+          onClick={() => setCurrentPage("leftovers")}
+        >
+          ♻️ Leftover Intelligence
+        </button>
+
+        <button
+          className={currentPage === "planner" ? "tab active" : "tab"}
+          onClick={() => setCurrentPage("planner")}
+        >
+          📅 Weekly Planner
         </button>
       </div>
 
@@ -4744,7 +4756,7 @@ function App() {
                         </div>
 
                         <div style={{ minWidth: "72px", textAlign: "center", padding: "8px", borderRadius: "10px", background: "#f0fdf4" }}>
-                          <div style={{ fontSize: "11px", color: "#64748b" }}>Score</div>
+                          <div style={{ fontSize: "11px", color: "#64748b" }}>ML suitability</div>
                           <strong>{Number(recipe.final_score || 0).toFixed(3)}</strong>
                         </div>
                       </div>
@@ -4754,7 +4766,7 @@ function App() {
                           ["Pantry match", `${(Number(recipe.pantry_score || 0) * 100).toFixed(0)}%`],
                           ["Expiry score", `${(Number(recipe.expiry_score || 0) * 100).toFixed(0)}%`],
                           ["Content match", `${(Number(recipe.content_score || 0) * 100).toFixed(0)}%`],
-                          ["Collaborative", `${(Number(recipe.collaborative_score || 0) * 100).toFixed(0)}%`],
+                          ["ML suitability", `${(Number(recipe.hgb_suitability_score || recipe.rf_suitability_score || 0) * 100).toFixed(0)}%`],
                         ].map(([label, value]) => (
                           <div key={label} style={{ padding: "10px", borderRadius: "10px", background: "#f8fafc" }}>
                             <small style={{ color: "#64748b" }}>{label}</small>
@@ -4762,6 +4774,48 @@ function App() {
                           </div>
                         ))}
                       </div>
+
+                      {recipe.nutrition_available ? (
+                        <div style={{ marginTop: "12px", padding: "14px", borderRadius: "12px", background: "#f0fdf4", border: "1px solid #dcfce7" }}>
+                          <strong>🥗 Nutrition per serving</strong>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginTop: "10px", fontSize: "12px", color: "#475569" }}>
+                            <span>Calories: <b>{Number(recipe.calories || 0).toFixed(0)} kcal</b></span>
+                            <span>Protein: <b>{Number(recipe.protein || 0).toFixed(1)} g</b></span>
+                            <span>Carbohydrates: <b>{Number(recipe.carbohydrates || 0).toFixed(1)} g</b></span>
+                            <span>Fat: <b>{Number(recipe.fat || 0).toFixed(1)} g</b></span>
+                            <span>Fibre: <b>{Number(recipe.fibre || 0).toFixed(1)} g</b></span>
+                            <span>Sodium: <b>{Number(recipe.sodium || 0).toFixed(0)} mg</b></span>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {recipe.nutrition_available ? (
+                        <div style={{ marginTop: "12px", padding: "14px", borderRadius: "12px", background: "#f0fdf4", border: "1px solid #dcfce7" }}>
+                          <strong>🥗 Nutrition per serving</strong>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginTop: "10px", fontSize: "12px", color: "#475569" }}>
+                            <span>Calories: <b>{Number(recipe.calories || 0).toFixed(0)} kcal</b></span>
+                            <span>Protein: <b>{Number(recipe.protein || 0).toFixed(1)} g</b></span>
+                            <span>Carbohydrates: <b>{Number(recipe.carbohydrates || 0).toFixed(1)} g</b></span>
+                            <span>Fat: <b>{Number(recipe.fat || 0).toFixed(1)} g</b></span>
+                            <span>Fibre: <b>{Number(recipe.fibre || 0).toFixed(1)} g</b></span>
+                            <span>Sodium: <b>{Number(recipe.sodium || 0).toFixed(0)} mg</b></span>
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {recipe.nutrition_available ? (
+                        <div style={{ marginTop: "12px", padding: "14px", borderRadius: "12px", background: "#f0fdf4", border: "1px solid #dcfce7" }}>
+                          <strong>🥗 Nutrition per serving</strong>
+                          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginTop: "10px", fontSize: "12px", color: "#475569" }}>
+                            <span>Calories: <b>{Number(recipe.calories || 0).toFixed(0)} kcal</b></span>
+                            <span>Protein: <b>{Number(recipe.protein || 0).toFixed(1)} g</b></span>
+                            <span>Carbohydrates: <b>{Number(recipe.carbohydrates || 0).toFixed(1)} g</b></span>
+                            <span>Fat: <b>{Number(recipe.fat || 0).toFixed(1)} g</b></span>
+                            <span>Fibre: <b>{Number(recipe.fibre || 0).toFixed(1)} g</b></span>
+                            <span>Sodium: <b>{Number(recipe.sodium || 0).toFixed(0)} mg</b></span>
+                          </div>
+                        </div>
+                      ) : null}
 
                       <div
                         style={{
@@ -4851,6 +4905,18 @@ function App() {
           </section>
         )}
 
+
+        {currentPage === "leftovers" && (
+          <section className="section-card" style={{ marginTop: "24px" }}>
+            <LeftoverDonation pantryItems={pantryItems} />
+          </section>
+        )}
+
+        {currentPage === "planner" && (
+          <section className="section-card" style={{ marginTop: "24px" }}>
+            <WeeklyMealPlanner pantryItems={pantryItems} />
+          </section>
+        )}
 
         {assistantLoading && (
           <div

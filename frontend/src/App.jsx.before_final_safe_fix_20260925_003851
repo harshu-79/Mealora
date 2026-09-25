@@ -866,11 +866,7 @@ function App() {
   const recognitionRef = useRef(null);
   const ocrWorkerRef = useRef(null);
 
-  async function openRecipeAssistant(
-    recipe,
-    languageOverride = null,
-    rememberSource = true
-  ) {
+  async function openRecipeAssistant(recipe, languageOverride = null, rememberSource = true) {
     const requestedLanguage = languageOverride || assistantLanguage;
 
     if (!recipe?.recipe_id) {
@@ -878,6 +874,8 @@ function App() {
       return;
     }
 
+    // Store ONLY the original Mealora dataset identity. Never replace this with
+    // Gemini's translated recipe name. This is critical for language switching.
     const sourceRecipe = {
       recipe_id: recipe.recipe_id,
       recipe_name: recipe.recipe_name,
@@ -890,94 +888,32 @@ function App() {
     const requestId = ++assistantRequestRef.current;
     setAssistantLoading(true);
     setAssistantError("");
-    setAssistantRecipe(null);
 
-    async function requestRecipe(language) {
+    try {
       const response = await fetch(RECIPE_ASSISTANT_API, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           recipe_id: sourceRecipe.recipe_id,
           recipe_name: sourceRecipe.recipe_name,
-          language,
+          language: requestedLanguage,
         }),
       });
 
-      let data = null;
+      const data = await response.json();
 
-      try {
-        data = await response.json();
-      } catch {
-        data = null;
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || "Unable to prepare the selected recipe.");
       }
 
-      if (!response.ok || !data?.success) {
-        throw new Error(
-          data?.error ||
-            `Recipe assistant request failed (${response.status}).`
-        );
-      }
-
-      if (!data.recipe) {
-        throw new Error("Recipe assistant returned no recipe data.");
-      }
-
-      return data.recipe;
-    }
-
-    try {
-      let result;
-
-      try {
-        result = await requestRecipe(requestedLanguage);
-      } catch (firstError) {
-        console.warn("Recipe presentation failed:", firstError);
-
-        if (String(requestedLanguage).trim().toLowerCase() !== "english") {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-
-          try {
-            result = await requestRecipe(requestedLanguage);
-          } catch (translationError) {
-            console.warn(
-              "Translation unavailable; falling back to English:",
-              translationError
-            );
-
-            result = await requestRecipe("English");
-            result = {
-              ...result,
-              note:
-                "The selected language service is temporarily unavailable. " +
-                "Mealora is showing the original recipe in English.",
-            };
-          }
-        } else {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          result = await requestRecipe("English");
-        }
-      }
-
+      // Ignore an older Gemini response if the user changed language again.
       if (requestId !== assistantRequestRef.current) return;
 
-      setAssistantRecipe(result);
+      setAssistantRecipe(data.recipe);
     } catch (error) {
-      console.error("Recipe assistant error:", error);
-
-      setAssistantRecipe({
-        recipe_id: sourceRecipe.recipe_id,
-        recipe_name: sourceRecipe.recipe_name,
-        language: "English",
-        ingredients: [],
-        instructions: [],
-        note:
-          "The recipe service is temporarily unavailable. " +
-          "Please restart the Mealora backend and try again.",
-      });
-
-      setAssistantError(
-        error?.message || "Unable to prepare the selected recipe."
-      );
+      if (requestId !== assistantRequestRef.current) return;
+      console.error("Gemini recipe assistant error:", error);
+      setAssistantError(error.message || "Unable to prepare the recipe.");
     } finally {
       if (requestId === assistantRequestRef.current) {
         setAssistantLoading(false);
@@ -4536,53 +4472,6 @@ function App() {
             )}
 
 
-            {contextInfo && (
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "center",
-                  marginTop: "14px",
-                }}
-              >
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => {
-                    const latitude = contextInfo.latitude;
-                    const longitude = contextInfo.longitude;
-
-                    const query =
-                      latitude !== null &&
-                      latitude !== undefined &&
-                      longitude !== null &&
-                      longitude !== undefined
-                        ? `${latitude},${longitude}`
-                        : contextInfo.location_name ||
-                          contextInfo.location_city ||
-                          "India";
-
-                    const mapsUrl =
-                      "https://www.google.com/maps/search/?api=1&query=" +
-                      encodeURIComponent(query);
-
-                    window.open(
-                      mapsUrl,
-                      "_blank",
-                      "noopener,noreferrer"
-                    );
-                  }}
-                  style={{
-                    padding: "10px 18px",
-                    borderRadius: "10px",
-                    fontWeight: "700",
-                    cursor: "pointer",
-                  }}
-                >
-                  📍 Open Location in Google Maps
-                </button>
-              </div>
-            )}
-
               {/* GET RECOMMENDATIONS BUTTON - CENTERED BELOW MODES */}
               <div style={{ display: "flex", justifyContent: "center", marginTop: "20px" }}>
                 <button
@@ -5054,9 +4943,7 @@ function App() {
                 Preparing your recipe
               </h3>
               <p style={{ color: "#64748b", margin: 0 }}>
-                {String(assistantLanguage).trim().toLowerCase() === "english"
-                  ? "Opening the recipe selected by Mealora."
-                  : "Gemini is translating the recipe selected by Mealora."}
+                Gemini is translating the recipe selected by Mealora.
               </p>
             </div>
           </div>

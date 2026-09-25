@@ -641,17 +641,20 @@ def context():
 
 @app.route("/api/recipe-assistant", methods=["POST"])
 def recipe_assistant():
+    """
+    Presentation-only endpoint.
+    The selected recipe comes from Mealora's ML ranker; Gemini translates
+    and formats that exact recipe in the requested language.
+    """
     try:
         data = request.get_json() or {}
-
         recipe = _get_recipe_for_gemini(
             recipe_id=data.get("recipe_id"),
             recipe_name=data.get("recipe_name"),
         )
-
         language = data.get("language", "English")
 
-        # English NEVER calls Gemini.
+        # English recipe display must work even when Gemini is unavailable.
         if str(language).strip().lower() == "english":
             result = {
                 "recipe_id": recipe.get("recipe_id"),
@@ -659,70 +662,23 @@ def recipe_assistant():
                 "language": "English",
                 "ingredients": recipe.get("ingredients", []),
                 "instructions": recipe.get("instructions", []),
-                "note": "Recipe presented directly from Mealora's recipe dataset.",
-                "source": "Mealora recipe dataset",
+                "note": "Recipe presented directly from Mealora's recipe dataset."
             }
-
-            return jsonify({
-                "success": True,
-                "assistant_role": "recipe_presentation",
-                "recipe": result,
-            })
-
-        # Non-English: Gemini with one retry.
-        last_error = None
-
-        for attempt in range(2):
-            try:
-                result = _gemini_translate_recipe(recipe, language)
-
-                return jsonify({
-                    "success": True,
-                    "assistant_role": "translation_and_recipe_presentation_only",
-                    "recipe": result,
-                })
-
-            except Exception as exc:
-                last_error = exc
-                print(
-                    f"Gemini recipe presentation attempt "
-                    f"{attempt + 1}/2 failed: {exc}"
-                )
-
-                if attempt == 0:
-                    import time
-                    time.sleep(1.0)
-
-        # Gemini unavailable: return original English recipe.
-        fallback = {
-            "recipe_id": recipe.get("recipe_id"),
-            "recipe_name": recipe.get("recipe_name"),
-            "language": "English",
-            "ingredients": recipe.get("ingredients", []),
-            "instructions": recipe.get("instructions", []),
-            "note": (
-                "The selected language service is temporarily unavailable. "
-                "Mealora is showing the original recipe in English."
-            ),
-            "source": "Mealora recipe dataset (English fallback)",
-            "translation_error": str(last_error) if last_error else "",
-        }
+        else:
+            result = _gemini_translate_recipe(recipe, language)
 
         return jsonify({
             "success": True,
-            "assistant_role": "recipe_presentation_with_translation_fallback",
-            "recipe": fallback,
+            "assistant_role": "translation_and_recipe_presentation_only",
+            "recipe": result,
         })
-
-    except Exception as exc:
+    except Exception as e:
         import traceback
         traceback.print_exc()
-
         return jsonify({
             "success": False,
-            "error": str(exc),
+            "error": str(e)
         }), 500
-
 
 @app.route("/api/recommendations", methods=["POST"])
 def recommendations():

@@ -651,7 +651,7 @@ def recipe_assistant():
 
         language = data.get("language", "English")
 
-        # English NEVER calls Gemini.
+        # English never depends on Gemini.
         if str(language).strip().lower() == "english":
             result = {
                 "recipe_id": recipe.get("recipe_id"),
@@ -669,7 +669,7 @@ def recipe_assistant():
                 "recipe": result,
             })
 
-        # Non-English: Gemini with one retry.
+        # Non-English: retry Gemini once after a short delay.
         last_error = None
 
         for attempt in range(2):
@@ -682,18 +682,17 @@ def recipe_assistant():
                     "recipe": result,
                 })
 
-            except Exception as exc:
-                last_error = exc
+            except Exception as e:
+                last_error = e
                 print(
-                    f"Gemini recipe presentation attempt "
-                    f"{attempt + 1}/2 failed: {exc}"
+                    f"Gemini recipe presentation attempt {attempt + 1}/2 failed: {e}"
                 )
 
                 if attempt == 0:
                     import time
-                    time.sleep(1.0)
+                    time.sleep(1.2)
 
-        # Gemini unavailable: return original English recipe.
+        # Final fallback: never leave the frontend blank.
         fallback = {
             "recipe_id": recipe.get("recipe_id"),
             "recipe_name": recipe.get("recipe_name"),
@@ -714,13 +713,12 @@ def recipe_assistant():
             "recipe": fallback,
         })
 
-    except Exception as exc:
+    except Exception as e:
         import traceback
         traceback.print_exc()
-
         return jsonify({
             "success": False,
-            "error": str(exc),
+            "error": str(e),
         }), 500
 
 

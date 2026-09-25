@@ -1,22 +1,22 @@
 day,meal,recipe_id,recipe_name,mealora_score,rf_suitability_score,han_score,pantry_score,expiry_score,nutrition_score,nutrition_available,context_score,household_servings,planning_algorithm
-Monday,Breakfast,2340,Vegetable Uttapam Recipe (Vegetable Uttapam),0.5942,1.0,0.8226,0.25,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Monday,Lunch,2691,Amla Rasam Recipe,0.5591,0.985,0.7908,0.0714,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Monday,Dinner,4328,Green Apple Rasam Recipe,0.5611,1.0,0.7895,0.0714,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Tuesday,Breakfast,9406,Masala Dosa Recipe With Vegetable Filling Recipe,0.5401,0.985,0.8159,0.1765,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Tuesday,Lunch,11393,Veppam Poo Rasam Recipe (Neem flower Rasam),0.582,1.0,0.8072,0.0909,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Tuesday,Dinner,11635,Coriander Semiya Recipe - Vermicelli Pulao,0.5162,0.99,0.8107,0.1333,0.5,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Wednesday,Breakfast,3686,Egg Dosa Recipe With Cheesy Garlic Mayo,0.5619,0.985,0.7385,0.2727,0.6667,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Wednesday,Lunch,4399,Serial recipe of radish leaves - South Indian Style Radish Greens Stir Fry (Recipe in Hindi),0.5686,1.0,0.8021,0.0769,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Wednesday,Dinner,3582,Drumstick Dal Soup Recipe,0.574,0.98,0.8105,0.2,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Monday,Breakfast,13579,Instant Rava Pizza Uttapam Recipe,0.5668,0.965,0.7952,0.25,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Monday,Lunch,13778,Neem Flower Rasam (Recipe In Hindi),0.5741,0.99,0.8071,0.0833,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Monday,Dinner,13495,Semiya Biryani Recipe,0.5323,1.0,0.7736,0.125,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Tuesday,Breakfast,3089,Onion Tomato Podi Masala Dosa Recipe,0.5581,0.99,0.8184,0.2667,0.7,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Tuesday,Lunch,2333,Tamil Nadu Style Grinded Rasam Recipe,0.5654,1.0,0.818,0.0714,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Tuesday,Dinner,3582,Drumstick Dal Soup Recipe,0.574,0.98,0.8105,0.2,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Wednesday,Breakfast,9406,Masala Dosa Recipe With Vegetable Filling Recipe,0.5401,0.985,0.8159,0.1765,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Wednesday,Lunch,9441,Carrot And Capsicum Mix Dal Recipe,0.568,1.0,0.7589,0.1429,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Wednesday,Dinner,2635,Drumstick Dal Soup Recipe,0.572,0.98,0.7972,0.2,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
 Thursday,Breakfast,3552,Mini Rava Idli With Tomato Chutney Recipe,0.5836,1.0,0.8169,0.0909,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Thursday,Lunch,9441,Carrot And Capsicum Mix Dal Recipe,0.568,1.0,0.7589,0.1429,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Thursday,Dinner,3446,Muttai Kuzhambu Recipe - South Indian Egg Curry,0.547,0.995,0.7567,0.1538,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Friday,Breakfast,2470,Instant Rava Appam With Vegetables Recipe,0.5623,1.0,0.8088,0.1667,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Friday,Lunch,2538,Carrot and Capsicum Mix Dal Recipe,0.5675,0.99,0.8034,0.0769,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Friday,Dinner,2635,Drumstick Dal Soup Recipe,0.572,0.98,0.7972,0.2,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Saturday,Breakfast,13579,Instant Rava Pizza Uttapam Recipe,0.5668,0.965,0.7952,0.25,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Saturday,Lunch,12947,Radish Greens Poriyal Recipe (South Indian Style Radish Greens Stir Fry),0.5707,1.0,0.8161,0.0769,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Saturday,Dinner,13495,Semiya Biryani Recipe,0.5323,1.0,0.7736,0.125,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Sunday,Breakfast,4537,Vegetable Ragi & Oats Uttapam Recipe,0.5935,0.995,0.8016,0.1818,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Sunday,Lunch,2333,Tamil Nadu Style Grinded Rasam Recipe,0.5654,1.0,0.818,0.0714,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
-Sunday,Dinner,9657,Kongunadu Cucumber Juice Recipe - Spicy & Tonji Eggplant Juice,0.5325,0.935,0.8151,0.0556,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Thursday,Lunch,2538,Carrot and Capsicum Mix Dal Recipe,0.5675,0.99,0.8034,0.0769,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Thursday,Dinner,9657,Kongunadu Cucumber Juice Recipe - Spicy & Tonji Eggplant Juice,0.5325,0.935,0.8151,0.0556,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Friday,Breakfast,4537,Vegetable Ragi & Oats Uttapam Recipe,0.5935,0.995,0.8016,0.1818,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Friday,Lunch,2775,Tomato Rasam Recipe For Babies And Toddlers,0.5868,1.0,0.8138,0.1,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Friday,Dinner,3446,Muttai Kuzhambu Recipe - South Indian Egg Curry,0.547,0.995,0.7567,0.1538,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Saturday,Breakfast,2555,Uggani Recipe - Puffed Rice Upma,0.5538,1.0,0.7705,0.2143,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Saturday,Lunch,9871,Kandathippili Rasam Recipe - Long Pepper Rasam,0.5656,1.0,0.822,0.0714,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Saturday,Dinner,4328,Green Apple Rasam Recipe,0.5611,1.0,0.7895,0.0714,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Sunday,Breakfast,4467,Paneer Masala Dosa Recipe-Paneer Bhurji Dosa,0.5471,0.985,0.8054,0.1429,0.75,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Sunday,Lunch,4399,Serial recipe of radish leaves - South Indian Style Radish Greens Stir Fry (Recipe in Hindi),0.5686,1.0,0.8021,0.0769,1.0,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization
+Sunday,Dinner,12846,Baby Corn Stew Recipe,0.5078,0.935,0.8151,0.0526,0.8,0.5,0,0.53,2,NSGA-II Multi-Objective Evolutionary Optimization

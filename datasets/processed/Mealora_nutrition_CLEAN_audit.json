@@ -1,0 +1,11 @@
+{
+  "input": "/Users/harshitha/mealora/datasets/processed/recipe_master_dataset_nutrition_IFCT_V5.csv",
+  "output": "/Users/harshitha/mealora/datasets/processed/recipe_master_dataset_nutrition_CLEAN.csv",
+  "rows": 18568,
+  "verified_complete": 3061,
+  "suspicious_excluded_from_ml": 21,
+  "invalid_excluded_from_ml": 0,
+  "partial_excluded_from_ml": 8,
+  "unavailable": 15478,
+  "valid_for_ml": 3061
+}

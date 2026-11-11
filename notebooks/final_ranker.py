@@ -1,5 +1,7 @@
 import os
 import re
+import ast
+import json
 import joblib
 import numpy as np
 import pandas as pd
@@ -17,6 +19,11 @@ BASE = "datasets/processed"
 RECIPES = os.path.join(
     BASE,
     "recipe_master_dataset.csv"
+)
+
+NUTRITION = os.path.join(
+    BASE,
+    "recipe_master_dataset_nutrition_CLEAN.csv"
 )
 
 FEATURES = os.path.join(
@@ -197,6 +204,9 @@ def _automatic_context_scores(df, weather=None, festival=None, location=None):
                 ("soup", 1.0), ("rasam", 0.8), ("khichdi", 0.9),
                 ("stew", 0.9), ("curry", 0.7)
             ])
+        elif temp is not None and 20 < temp < 32:
+            # Neutral/pleasant weather still participates as a moderate signal.
+            weather_score = pd.Series(0.5, index=df.index)
 
     festival_score = pd.Series(0.0, index=df.index)
 
@@ -322,9 +332,9 @@ def _automatic_context_scores(df, weather=None, festival=None, location=None):
             festival_score = _keyword_score(df, keywords)
             break
 
-    # Location-aware scoring. The backend normally supplies a
-    # cuisine_hint, but accepting the city here makes the ranker
-    # robust for both API and direct Python calls.
+    # Location-aware scoring. City-specific regional terms are stronger
+    # than a broad cuisine label: Hyderabad -> Telangana/Andhra/Telugu/
+    # Hyderabadi, Chennai -> Tamil Nadu/Tamil/Chettinad, etc.
     location_score = pd.Series(0.0, index=df.index)
 
     city = _norm_text(
@@ -336,44 +346,263 @@ def _automatic_context_scores(df, weather=None, festival=None, location=None):
 
     location_cuisine = _norm_text(location.get("cuisine_hint"))
 
-    city_cuisine = {
-        "chennai": "south indian",
-        "coimbatore": "south indian",
-        "madurai": "south indian",
-        "trichy": "south indian",
-        "tiruchirappalli": "south indian",
-        "salem": "south indian",
-        "hyderabad": "andhra",
-        "vijayawada": "andhra",
-        "visakhapatnam": "andhra",
-        "bengaluru": "south indian",
-        "bangalore": "south indian",
-        "mysore": "south indian",
-        "mysuru": "south indian",
-        "kochi": "kerala",
-        "thiruvananthapuram": "kerala",
-        "trivandrum": "kerala",
-        "mumbai": "maharashtrian",
-        "pune": "maharashtrian",
-        "kolkata": "bengali",
-        "jaipur": "rajasthani",
-        "udaipur": "rajasthani",
-        "lucknow": "north indian",
-        "delhi": "north indian",
-        "new delhi": "north indian",
+    city_region_terms = {
+        "hyderabad": ["telangana", "andhra pradesh", "andhra", "telugu", "hyderabadi", "nizami", "deccan", "hyderabad"],
+        "vijayawada": ["andhra pradesh", "andhra", "telugu", "vijayawada"],
+        "visakhapatnam": ["andhra pradesh", "andhra", "telugu", "vizag", "visakhapatnam"],
+        "guntur": ["andhra pradesh", "andhra", "telugu", "guntur"],
+        "chennai": ["tamil nadu", "tamil", "chettinad", "chennai"],
+        "coimbatore": ["tamil nadu", "tamil", "kongu", "coimbatore"],
+        "madurai": ["tamil nadu", "tamil", "madurai"],
+        "trichy": ["tamil nadu", "tamil", "trichy", "tiruchirappalli"],
+        "salem": ["tamil nadu", "tamil", "salem"],
+        "bengaluru": ["karnataka", "kannada", "udupi", "bengaluru", "bangalore"],
+        "bangalore": ["karnataka", "kannada", "udupi", "bengaluru", "bangalore"],
+        "mysore": ["karnataka", "kannada", "mysore", "mysuru"],
+        "mysuru": ["karnataka", "kannada", "mysore", "mysuru"],
+        "kochi": ["kerala", "malabar", "malayali", "kochi"],
+        "thiruvananthapuram": ["kerala", "malayali", "thiruvananthapuram", "trivandrum"],
+        "trivandrum": ["kerala", "malayali", "thiruvananthapuram", "trivandrum"],
+        "mumbai": ["maharashtra", "marathi", "konkani", "mumbai"],
+        "pune": ["maharashtra", "marathi", "pune"],
+        "kolkata": ["west bengal", "bengali", "kolkata"],
+        "jaipur": ["rajasthan", "rajasthani", "jaipur"],
+        "udaipur": ["rajasthan", "rajasthani", "udaipur"],
+        "lucknow": ["uttar pradesh", "awadhi", "lucknow"],
+        "delhi": ["delhi", "delhi ncr", "punjabi", "mughlai", "north indian"],
+        "new delhi": ["delhi", "delhi ncr", "punjabi", "mughlai", "north indian"],
     }
 
-    if not location_cuisine and city:
-        location_cuisine = city_cuisine.get(city, "")
+    regional_columns = [
+        c for c in [
+            "state", "state_name", "region", "regional",
+            "regional_cuisine", "food_region", "cuisine", "recipe_name"
+        ] if c in df.columns
+    ]
 
-    if location_cuisine:
-        location_score = _keyword_score(
-            df,
-            [(location_cuisine, 1.0)]
+    if city in city_region_terms and regional_columns:
+        regional_text = (
+            df[regional_columns]
+            .fillna("")
+            .astype(str)
+            .agg(" ".join, axis=1)
+            .str.lower()
         )
+        hits = np.zeros(len(df), dtype=float)
+        for term in city_region_terms[city]:
+            hits += regional_text.str.contains(term, regex=False, na=False).astype(float).to_numpy()
+        location_score = pd.Series(np.clip(hits, 0.0, 1.0), index=df.index)
+    elif location_cuisine:
+        location_score = _keyword_score(df, [(location_cuisine, 1.0)])
 
     return weather_score, festival_score, location_score
 
+
+
+
+# ============================================================
+# LIVE PANTRY + EXPIRY SUPPORT
+# ============================================================
+# The recommendation engine receives the CURRENT Supabase pantry
+# from the frontend. The precomputed pantry/expiry CSVs remain as
+# fallbacks, but they are not allowed to override the live pantry.
+
+_LIVE_INGREDIENT_ALIASES = {
+    "tomatoes": "tomato",
+    "onions": "onion",
+    "potatoes": "potato",
+    "carrots": "carrot",
+    "capsicums": "capsicum",
+    "chillies": "chilli",
+    "chilies": "chilli",
+    "eggs": "egg",
+    "prawns": "prawn",
+    "shrimps": "shrimp",
+    "yogurt": "curd",
+    "yoghurt": "curd",
+    "dahi": "curd",
+    "cilantro": "coriander leaves",
+    "coriander leaf": "coriander leaves",
+    "curry leaf": "curry leaves",
+    "curry leaves": "curry leaves",
+}
+
+_LIVE_UNITS = (
+    "kilograms", "kilogram", "kgs", "kg", "grams", "gram", "g",
+    "litres", "litre", "liter", "liters", "l", "millilitres",
+    "millilitre", "milliliters", "milliliter", "ml", "tablespoons",
+    "tablespoon", "tbsp", "teaspoons", "teaspoon", "tsp", "cups",
+    "cup", "pieces", "piece", "dozen"
+)
+
+
+def _live_clean_ingredient(value):
+    text = str(value or "").strip().lower()
+    if not text or text in {"nan", "none", "null"}:
+        return ""
+
+    text = re.sub(r"\([^)]*\)", " ", text)
+    units = "|".join(re.escape(x) for x in _LIVE_UNITS)
+    text = re.sub(
+        rf"^\s*\d+(?:\.\d+)?\s*(?:{units})?\s*(?:of\s+)?",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"\b(chopped|sliced|diced|minced|grated|crushed|ground|"
+        r"finely|roughly|freshly|to taste|as needed)\b",
+        " ",
+        text,
+    )
+    text = re.sub(r"[^a-z0-9\s-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if text in _LIVE_INGREDIENT_ALIASES:
+        text = _LIVE_INGREDIENT_ALIASES[text]
+
+    # Simple plural normalization without damaging multi-word names.
+    if text.endswith("ies") and len(text) > 4:
+        text = text[:-3] + "y"
+    elif text.endswith("s") and len(text) > 3 and not text.endswith("ss"):
+        text = text[:-1]
+
+    return _LIVE_INGREDIENT_ALIASES.get(text, text)
+
+
+def _live_parse_recipe_ingredients(value):
+    if isinstance(value, list):
+        return [x for x in (_live_clean_ingredient(v) for v in value) if x]
+
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(text)
+                if isinstance(parsed, list):
+                    return [x for x in (_live_clean_ingredient(v) for v in parsed) if x]
+            except Exception:
+                pass
+
+    parts = re.split(r"\n|;|\|", text)
+    if len(parts) == 1:
+        parts = [x.strip() for x in text.split(",")]
+
+    return [x for x in (_live_clean_ingredient(v) for v in parts) if x]
+
+
+def _live_ingredient_match(recipe_ingredient, pantry_name):
+    a = _live_clean_ingredient(recipe_ingredient)
+    b = _live_clean_ingredient(pantry_name)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Allow specific pantry names to satisfy a more detailed recipe name,
+    # e.g. "basmati rice" -> "rice", but avoid one-character matches.
+    if len(b) >= 4 and (b in a or a in b):
+        return True
+    return False
+
+
+def _apply_live_pantry(df, pantry_items):
+    """Apply CURRENT pantry quickly; avoid nested recipe x pantry loops."""
+    if not pantry_items:
+        return False
+
+    ingredient_col = next((c for c in [
+        "ingredient_names", "ingredients", "ingredient_list",
+        "Cleaned-Ingredients", "TranslatedIngredients"
+    ] if c in df.columns), None)
+
+    if not ingredient_col:
+        print("LIVE pantry warning: no recipe ingredient column found; using precomputed pantry features.")
+        return False
+
+    from datetime import date, datetime as _dt
+    today = date.today()
+    pantry_names = []
+    expiry_weights = {}
+
+    for item in pantry_items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("normalized_name") or item.get("ingredient_name") or item.get("name")
+        cleaned = _live_clean_ingredient(name)
+        if not cleaned:
+            continue
+        try:
+            q = item.get("quantity")
+            if q is not None and str(q).strip() and float(q) <= 0:
+                continue
+        except (TypeError, ValueError):
+            pass
+        if cleaned not in pantry_names:
+            pantry_names.append(cleaned)
+        exp = item.get("expiry_date")
+        if exp:
+            try:
+                days = (_dt.strptime(str(exp)[:10], "%Y-%m-%d").date() - today).days
+                weight = 0.0 if days < 0 else 1.0 if days <= 3 else 0.85 if days <= 7 else 0.60 if days <= 14 else 0.30 if days <= 30 else 0.0
+                expiry_weights[cleaned] = max(expiry_weights.get(cleaned, 0.0), weight)
+            except (TypeError, ValueError):
+                pass
+
+    if not pantry_names:
+        df["pantry_match_pct"] = 0.0
+        df["missing_ingredient_count"] = 0.0
+        df["pantry_score"] = 0.0
+        df["expiry_score"] = 0.0
+        return True
+
+    # One compiled regex replaces the previous recipe-ingredient x pantry nested loop.
+    # Longest terms first prevents a generic term from stealing a more specific match.
+    pattern = re.compile(
+        "|".join(re.escape(x) for x in sorted(pantry_names, key=len, reverse=True)),
+        flags=re.IGNORECASE,
+    )
+
+    # Parse each unique recipe ingredient string only once.
+    parse_cache = {}
+    pantry_scores = np.zeros(len(df), dtype=float)
+    missing_counts = np.zeros(len(df), dtype=float)
+    expiry_scores = np.zeros(len(df), dtype=float)
+
+    values = df[ingredient_col].fillna("").astype(str).tolist()
+    for i, raw in enumerate(values):
+        ingredients = parse_cache.get(raw)
+        if ingredients is None:
+            ingredients = _live_parse_recipe_ingredients(raw)
+            parse_cache[raw] = ingredients
+        if not ingredients:
+            continue
+
+        match_count = 0
+        best_expiry = 0.0
+        for ingredient in ingredients:
+            m = pattern.search(ingredient)
+            if m:
+                matched = _live_clean_ingredient(m.group(0))
+                match_count += 1
+                best_expiry = max(best_expiry, expiry_weights.get(matched, 0.0))
+
+        pantry_scores[i] = match_count / len(ingredients)
+        missing_counts[i] = len(ingredients) - match_count
+        expiry_scores[i] = best_expiry
+
+    df["pantry_match_pct"] = pantry_scores
+    df["missing_ingredient_count"] = missing_counts
+    df["pantry_score"] = np.clip(pantry_scores, 0, 1)
+    df["expiry_score"] = np.clip(expiry_scores, 0, 1)
+
+    print(
+        f"LIVE pantry applied: {len(pantry_names)} available items; "
+        f"best pantry match={df['pantry_score'].max():.0%}; "
+        f"recipes with pantry match={(df['pantry_score'] > 0).sum()}"
+    )
+    return True
 
 
 def recommend(
@@ -387,6 +616,7 @@ def recommend(
     weather=None,
     festival=None,
     location=None,
+    pantry_items=None,
 ):
 
     # --------------------------------------------------------
@@ -403,10 +633,6 @@ def recommend(
     pantry = pd.read_csv(PANTRY)
 
     expiry = pd.read_csv(EXPIRY)
-
-    interactions = pd.read_csv(
-        INTERACTIONS
-    )
 
     print(
         "Recipes loaded:",
@@ -535,62 +761,15 @@ def recommend(
     df["content_score"] = content_scores
 
     # ========================================================
-    # 2. PERSONAL BEHAVIOUR LEARNING
+    # 2. CONTENT-BASED RECOMMENDATION
     # ========================================================
 
-    print(
-        "Calculating personal behaviour score..."
-    )
+    # Mealora is a single-user application.
+    # No collaborative or multi-user score is used.
+    df["personal_behavior_score"] = 0.0
 
-    interaction_weights = {
-        "cooked": 1.00,
-        "liked": 0.85,
-        "saved": 0.70,
-        "skipped": 0.20,
-        "disliked": 0.00,
-    }
-
-    if "interaction" not in interactions.columns:
-        interactions["interaction"] = ""
-
-    interactions["preference"] = (
-        interactions["interaction"]
-        .astype(str)
-        .str.lower()
-        .map(interaction_weights)
-    )
-
-    if "rating" in interactions.columns:
-        interactions["preference"] = interactions["preference"].fillna(
-            pd.to_numeric(interactions["rating"], errors="coerce") / 5.0
-        )
-
-    interactions["preference"] = interactions["preference"].fillna(0).clip(0, 1)
-
-    personal = (
-        interactions[interactions["user_id"] == target_user]
-        .groupby("recipe_id")["preference"]
-        .mean()
-        if "user_id" in interactions.columns and "recipe_id" in interactions.columns
-        else pd.Series(dtype=float)
-    )
-
-    if len(personal) > 0 and personal.max() > 0:
-        personal = personal / personal.max()
-
-    df["personal_behavior_score"] = (
-        df["recipe_id"].map(personal).fillna(0).clip(0, 1)
-    )
-
-    # ========================================================
-    # 3. HYBRID CONTENT + PERSONAL BEHAVIOUR
-    # ========================================================
-
-    df["hybrid_score"] = (
-        0.70 * df["content_score"]
-        +
-        0.30 * df["personal_behavior_score"]
-    )
+    # Content similarity is the primary recipe similarity signal.
+    df["hybrid_score"] = df["content_score"]
 
     # ========================================================
     # 4. PANTRY COMPATIBILITY
@@ -612,32 +791,25 @@ def recommend(
     # 5. EXPIRY SCORE
     # ========================================================
 
-    print(
-        "Calculating expiry score..."
-    )
+    print("Calculating expiry score...")
 
-    expiry_map = expiry.set_index(
-        "recipe_id"
-    )["expiry_score"]
-
-    df["expiry_score"] = (
-        df["recipe_id"]
-        .map(expiry_map)
-        .fillna(0)
-    )
-
-    df["expiry_score"] = pd.to_numeric(
-        df["expiry_score"],
-        errors="coerce"
-    ).fillna(0)
-
-    df["expiry_score"] = (
-        df["expiry_score"]
-        .clip(
-            lower=0,
-            upper=1
+    # IMPORTANT PERFORMANCE FIX:
+    # When the frontend sends the CURRENT pantry, do not build/map the
+    # 18k-row expiry CSV. Live pantry expiry is calculated directly below.
+    # The CSV is used only as the fallback when no live pantry is supplied.
+    if pantry_items:
+        df["expiry_score"] = 0.0
+        _live_pantry_used = _apply_live_pantry(df, pantry_items)
+    else:
+        expiry_map = (
+            expiry.drop_duplicates("recipe_id")
+            .set_index("recipe_id")["expiry_score"]
         )
-    )
+        df["expiry_score"] = pd.to_numeric(
+            df["recipe_id"].map(expiry_map),
+            errors="coerce"
+        ).fillna(0).clip(0, 1)
+        _live_pantry_used = False
 
     # --------------------------------------------------------
     # AUTOMATIC REAL-WORLD CONTEXT SCORES
@@ -817,14 +989,13 @@ def recommend(
     # --------------------------------------------------------
 
     df["context_score"] = (
-        0.22 * df["meal_match"]
-        + 0.22 * df["diet_match"]
-        + 0.16 * df["cuisine_match"]
+        0.25 * df["meal_match"]
+        + 0.25 * df["diet_match"]
+        + 0.20 * df["cuisine_match"]
         + 0.15 * df["time_match"]
         + 0.10 * df["weather_score"]
-        + 0.10 * df["festival_score"]
-        + 0.05 * df["location_score"]
-    )
+        + 0.05 * df["festival_score"]
+    ).clip(0, 1)
 
     print(
         "Context:",
@@ -840,64 +1011,19 @@ def recommend(
     )
 
     # ========================================================
-    # NUTRITION SCORE
+    # NUTRITION
     # ========================================================
-    # Only recipes with real nutrition values are scored. Missing
-    # nutrition is neutral and never treated as zero nutrition.
-    nutrition_cols = {
-        "calories": ["calories", "Calories (kcal)"],
-        "protein": ["protein", "Protein (g)"],
-        "carbohydrates": ["carbohydrates", "Carbohydrates (g)"],
-        "fat": ["fat", "Fats (g)"],
-        "fibre": ["fibre", "Fibre (g)"],
-    }
-
-    def _find_col(options):
-        for c in options:
-            if c in df.columns:
-                return c
-        return None
-
-    nmap = {k: _find_col(v) for k, v in nutrition_cols.items()}
-    nutrition_available = pd.Series(True, index=df.index)
-    for c in nmap.values():
-        if c is not None:
-            nutrition_available &= pd.to_numeric(df[c], errors="coerce").notna()
-        else:
-            nutrition_available &= False
-
-    df["nutrition_available"] = nutrition_available.astype(float)
-    df["nutrition_score"] = 0.5
-
-    if nutrition_available.any():
-        valid = df.loc[nutrition_available].copy()
-
-        def _norm_col(key):
-            c = nmap[key]
-            x = pd.to_numeric(valid[c], errors="coerce")
-            if x.max() == x.min():
-                return pd.Series(0.5, index=valid.index)
-            return ((x - x.min()) / (x.max() - x.min())).clip(0, 1).fillna(0.5)
-
-        protein_n = _norm_col("protein")
-        fibre_n = _norm_col("fibre")
-        calories = pd.to_numeric(valid[nmap["calories"]], errors="coerce")
-        fat = pd.to_numeric(valid[nmap["fat"]], errors="coerce")
-        cal_med = calories.median()
-        fat_med = fat.median()
-        cal_dev = (calories - cal_med).abs()
-        fat_dev = (fat - fat_med).abs()
-        calorie_score = 1 - (cal_dev / cal_dev.max()).replace([np.inf, -np.inf], np.nan).fillna(0.5) if cal_dev.max() else pd.Series(0.5, index=valid.index)
-        fat_score = 1 - (fat_dev / fat_dev.max()).replace([np.inf, -np.inf], np.nan).fillna(0.5) if fat_dev.max() else pd.Series(0.5, index=valid.index)
-        df.loc[valid.index, "nutrition_score"] = (
-            0.35 * protein_n + 0.30 * fibre_n + 0.20 * calorie_score + 0.15 * fat_score
-        ).clip(0, 1)
-
-    print(
-        "Nutrition coverage in current recipes:",
-        f"{int(df['nutrition_available'].sum())}/{len(df)}",
-        f"({100 * df['nutrition_available'].mean():.2f}%)"
-    )
+    # IMPORTANT:
+    # Nutrition is DISPLAY-ONLY.
+    #
+    # It does NOT:
+    # - train the recommendation model
+    # - filter candidates
+    # - affect candidate_base_score
+    # - affect final_score
+    #
+    # Nutrition values are attached AFTER the ML ranking below.
+    # ========================================================
 
     # ========================================================
     # 7. MULTI-FACTOR CANDIDATE FILTER
@@ -932,26 +1058,31 @@ def recommend(
         result = apply_constraint(result, df["cuisine_match"].eq(1), "cuisine")
     result = apply_constraint(result, df["time_match"].eq(1), "maximum cooking time")
 
-    # Pantry + expiry + contextual compatibility are soft-ranked
-    # within the eligible pool so sparse pantry data does not empty it.
+    # Location is a strong preference, but pantry remains the primary factor.
+    # Do not hard-filter here: a recipe with a stronger pantry match must not
+    # disappear merely because it is less regional. Location participates in
+    # the cumulative suitability score below.
+    result["location_match"] = result["location_score"].clip(0, 1)
+
+    # Pantry + expiry + location + context are combined into a transparent
+    # cumulative score. Pantry is deliberately the largest component.
     result["candidate_base_score"] = (
-        0.25 * result["hybrid_score"]
-        + 0.25 * result["pantry_score"]
+        0.50 * result["pantry_score"]
         + 0.15 * result["expiry_score"]
-        + 0.15 * result["context_score"]
-        + 0.10 * result["nutrition_score"]
-        + 0.05 * result["time_match"]
-        + 0.03 * result["weather_score"]
-        + 0.02 * result["festival_score"]
+        + 0.12 * result["location_match"]
+        + 0.07 * result["festival_score"]
+        + 0.05 * result["weather_score"]
+        + 0.05 * result["context_score"]
+        + 0.03 * result["content_score"]
+        + 0.03 * result["han_score"]
     ).clip(0, 1)
 
-    # Keep a bounded candidate pool. RF is the final supervised
-    # reranker, not the initial filter.
-    candidate_limit = max(100, top_k * 40)
-    result = result.sort_values(
-        ["candidate_base_score", "pantry_score", "expiry_score"],
-        ascending=False
-    ).head(candidate_limit).copy()
+    # IMPORTANT:
+    # Do NOT truncate candidates using candidate_base_score.
+    # Pantry priority must be evaluated across the entire eligible pool.
+    # RF is applied to the complete eligible pool before the final
+    # priority ordering.
+    result = result.copy()
 
     # ========================================================
     # 8. RANDOM FOREST FINAL RERANKING
@@ -979,24 +1110,229 @@ def recommend(
         result["rf_suitability_score"] = result["candidate_base_score"]
 
     # ========================================================
-    # 9. FINAL RF + HAN HYBRID RERANKING
+    # 9. PRIORITY-BASED FINAL RANKING
     # ========================================================
-    # RF and HAN operate on the SAME already-filtered candidate pool.
-    # They are final learned ranking signals, not broad candidate filters.
+    # IMPORTANT:
+    # Mealora uses a strict priority order for recommendation suitability:
+    #
+    #   1. Pantry availability
+    #   2. Expiry / food-waste priority
+    #   3. Context suitability
+    #   4. Content similarity
+    #   5. Random Forest suitability
+    #   6. HAN graph score
+    #
+    # These are NOT combined into one weighted average.
+    # A lower-priority signal must NOT overturn a higher-priority signal.
+    #
+    # Example:
+    # A recipe with 13% pantry match must rank above one with 7% pantry
+    # match, even if the 7% recipe has a higher expiry or content score.
+    #
+    # Nutrition is still completely excluded from ranking.
+    # ========================================================
+
+    # Transparent cumulative score shown as "Overall fit" in the UI.
+    # Pantry is the main signal; ML is deliberately a small final signal.
     result["final_score"] = (
-        0.20 * result["content_score"]
-        + 0.15 * result["pantry_score"]
+        0.55 * result["pantry_score"]
+        + 0.15 * result["location_match"]
         + 0.10 * result["expiry_score"]
-        + 0.10 * result["context_score"]
-        + 0.10 * result["nutrition_score"]
-        + 0.20 * result["rf_suitability_score"]
-        + 0.15 * result["han_score"]
+        + 0.07 * result["festival_score"]
+        + 0.05 * result["weather_score"]
+        + 0.04 * result["context_score"]
+        + 0.02 * result["content_score"]
+        + 0.015 * result["rf_suitability_score"]
+        + 0.005 * result["han_score"]
     ).clip(0, 1)
 
+    # The cumulative score balances every signal while keeping pantry
+    # availability clearly dominant. Location is the strongest contextual
+    # preference, and ML remains the smallest learned ranking signal.
     result = result.sort_values(
-        ["final_score", "rf_suitability_score", "han_score", "candidate_base_score"],
-        ascending=False
+        ["final_score", "pantry_score", "location_match", "expiry_score"],
+        ascending=[False, False, False, False],
+        kind="mergesort"
     ).head(top_k).copy()
+
+    # ========================================================
+    # ATTACH NUTRITION FOR DISPLAY ONLY
+    # ========================================================
+    #
+    # IMPORTANT:
+    # Nutrition is attached ONLY AFTER recommendation ranking.
+    #
+    # Nutrition does NOT:
+    # - train the ML model
+    # - filter candidates
+    # - affect candidate_base_score
+    # - affect rf_suitability_score
+    # - affect final_score
+    #
+    # The master recipe dataset already contains nutrition columns,
+    # so remove those columns from the ranked result first.
+    # Then attach the CLEAN nutrition dataset explicitly.
+    # ========================================================
+
+    # Actual nutrition values.
+    # These fields alone determine whether nutrition is available.
+    nutrition_fields = [
+        "calories",
+        "protein",
+        "carbohydrates",
+        "fat",
+        "fibre",
+        "sodium",
+        "calcium",
+        "iron",
+        "vitamin_c",
+        "folate",
+    ]
+
+    # Nutrition metadata is display/audit information only.
+    # Metadata MUST NOT make nutrition_available=True.
+    nutrition_metadata_fields = [
+        "nutrition_source",
+        "nutrition_confidence",
+        "nutrition_coverage_pct",
+    ]
+
+    all_nutrition_display_fields = (
+        nutrition_fields + nutrition_metadata_fields
+    )
+
+    # Remove any nutrition columns inherited from the master dataset.
+    # This prevents pandas _x/_y merge conflicts.
+    result = result.drop(
+        columns=[
+            c for c in nutrition_fields
+            if c in result.columns
+        ],
+        errors="ignore"
+    )
+
+    result["nutrition_available"] = False
+
+    if os.path.exists(NUTRITION):
+
+        try:
+            nutrition_df = pd.read_csv(
+                NUTRITION,
+                low_memory=False
+            )
+
+            if "recipe_id" not in nutrition_df.columns:
+                raise RuntimeError(
+                    "CLEAN nutrition dataset has no recipe_id column."
+                )
+
+            nutrition_df["recipe_id"] = (
+                nutrition_df["recipe_id"]
+                .astype(str)
+                .str.strip()
+            )
+
+            result["_nutrition_recipe_id"] = (
+                result["recipe_id"]
+                .astype(str)
+                .str.strip()
+            )
+
+            # Keep actual nutrition values and metadata that exist.
+            available_nutrition_fields = [
+                c for c in nutrition_fields
+                if c in nutrition_df.columns
+            ]
+
+            available_nutrition_metadata_fields = [
+                c for c in nutrition_metadata_fields
+                if c in nutrition_df.columns
+            ]
+
+            available_nutrition_display_fields = (
+                available_nutrition_fields
+                + available_nutrition_metadata_fields
+            )
+
+            nutrition_small = nutrition_df[
+                ["recipe_id"] + available_nutrition_display_fields
+            ].copy()
+
+            # One row per recipe.
+            nutrition_small = (
+                nutrition_small
+                .drop_duplicates(
+                    subset=["recipe_id"],
+                    keep="first"
+                )
+            )
+
+            # Rename recipe_id so there is no collision with result.recipe_id.
+            nutrition_small = nutrition_small.rename(
+                columns={
+                    "recipe_id": "_nutrition_recipe_id"
+                }
+            )
+
+            result = result.merge(
+                nutrition_small,
+                on="_nutrition_recipe_id",
+                how="left"
+            )
+
+            if available_nutrition_fields:
+
+                # IMPORTANT:
+                # Only actual nutrition values determine availability.
+                # Source/confidence/coverage metadata do NOT count.
+                result["nutrition_available"] = (
+                    result[available_nutrition_fields]
+                    .notna()
+                    .any(axis=1)
+                )
+
+            print(
+                "Nutrition attached for DISPLAY ONLY:",
+                f"{int(result['nutrition_available'].sum())}/{len(result)}"
+            )
+
+            result.drop(
+                columns=["_nutrition_recipe_id"],
+                inplace=True,
+                errors="ignore"
+            )
+
+        except Exception as exc:
+
+            print(
+                "Nutrition display attachment warning:",
+                exc
+            )
+
+            result.drop(
+                columns=["_nutrition_recipe_id"],
+                inplace=True,
+                errors="ignore"
+            )
+
+    else:
+
+        print(
+            "Nutrition display dataset not found:",
+            NUTRITION
+        )
+
+    # Guarantee stable frontend fields even when nutrition is unavailable.
+    for _nutrition_column in all_nutrition_display_fields:
+
+        if _nutrition_column not in result.columns:
+            result[_nutrition_column] = np.nan
+
+    result["nutrition_available"] = (
+        result["nutrition_available"]
+        .fillna(False)
+        .astype(bool)
+    )
 
     # ========================================================
     # RETURN RESULTS
@@ -1007,7 +1343,6 @@ def recommend(
             "recipe_id",
             "recipe_name",
             "content_score",
-            "personal_behavior_score",
             "hybrid_score",
             "pantry_score",
             "missing_ingredient_count",
@@ -1017,10 +1352,23 @@ def recommend(
             "weather_score",
             "festival_score",
             "location_score",
+            "location_match",
             "rf_suitability_score",
             "han_score",
-            "nutrition_score",
             "nutrition_available",
+            "calories",
+            "protein",
+            "carbohydrates",
+            "fat",
+            "fibre",
+            "sodium",
+            "calcium",
+            "iron",
+            "vitamin_c",
+            "folate",
+            "nutrition_source",
+            "nutrition_confidence",
+            "nutrition_coverage_pct",
             "candidate_base_score",
             "final_score",
         ]
@@ -1083,15 +1431,14 @@ if __name__ == "__main__":
     print(
         "\n"
         "1. TF-IDF + Cosine Similarity\n"
-        "2. Personal Behaviour Learning\n"
-        "3. Hybrid Content + Personal Behaviour Score\n"
-        "4. Pantry Compatibility\n"
-        "5. Expiry / Food-Waste Score\n"
-        "6. Context Score\n"
-        "7. Multi-factor Candidate Filtering\n"
-        "8. Random Forest Final Reranking\n"
-        "9. HAN Graph Reranking\n"
-        "10. Nutrition-aware Hybrid Final Ranking"
+        "2. Content-Based Recipe Similarity\n"
+        "3. Pantry Compatibility\n"
+        "4. Expiry / Food-Waste Score\n"
+        "5. Context Score\n"
+        "6. Multi-factor Candidate Filtering\n"
+        "7. Random Forest Final Reranking\n"
+        "8. HAN Graph Reranking\n"
+        "9. Nutrition Information Display (non-ranking)"
     )
 
     print(

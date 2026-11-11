@@ -1,0 +1,17 @@
+{
+  "input": "/Users/harshitha/mealora/datasets/processed/recipe_master_dataset.csv",
+  "output": "/Users/harshitha/mealora/datasets/processed/recipe_master_dataset_nutrition_IFCT_V5.csv",
+  "rows": 18568,
+  "columns": 48,
+  "ifct_records_loaded": 725,
+  "ifct_usable_profiles": 526,
+  "existing_complete_before": 123,
+  "recipes_with_any_nutrition_after": 3090,
+  "recipes_complete_nutrition_after": 3082,
+  "recipes_ifct_estimated": 2955,
+  "recipes_existing_complete": 123,
+  "recipes_insufficient_coverage": 6545,
+  "fully_matched_estimates": 50,
+  "partially_matched_estimates": 2909,
+  "note": "V5 uses IFCT 2017 ingredient profiles with stronger alias/normalization matching. Values are ingredient-derived estimates per 100 g of ingredient-derived mass; existing complete values are preserved. Original CSV is not overwritten. It does not fabricate nutrition for recipes lacking sufficient quantified ingredient evidence."
+}

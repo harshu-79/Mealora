@@ -1,0 +1,17 @@
+{
+  "input": "/Users/harshitha/mealora/datasets/processed/recipe_master_dataset.csv",
+  "output": "/Users/harshitha/mealora/datasets/processed/recipe_master_dataset_nutrition_IFCT.csv",
+  "rows": 18568,
+  "columns": 47,
+  "ifct_records_loaded": 725,
+  "ifct_usable_profiles": 526,
+  "existing_complete_before": 123,
+  "recipes_with_any_nutrition_after": 585,
+  "recipes_complete_nutrition_after": 573,
+  "recipes_ifct_estimated": 450,
+  "recipes_existing_complete": 123,
+  "recipes_insufficient_coverage": 9054,
+  "fully_matched_estimates": 30,
+  "partially_matched_estimates": 420,
+  "note": "Ingredient-derived values are estimates because recipe serving counts and cooking retention are not always available. Existing complete values are preserved. Original CSV is not overwritten."
+}

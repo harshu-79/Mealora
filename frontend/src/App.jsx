@@ -790,14 +790,6 @@ function getRecommendationExplanation(recipe, contextInfo) {
     reasons.push("📍 Matches your regional/location context");
   }
 
-  if (festival >= 0.50) {
-    reasons.push("🎉 Matches today's festival or occasion");
-  }
-
-  if (hgb >= 0.90) {
-    reasons.push("🤖 High ML suitability score");
-  }
-
   if (content >= 0.60) {
     reasons.push("🔎 Strong recipe-content similarity");
   }
@@ -806,6 +798,40 @@ function getRecommendationExplanation(recipe, contextInfo) {
   return reasons.slice(0, 4);
 }
 
+
+
+function normalizeRecipeLines(value) {
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x).trim()).filter(Boolean);
+  }
+
+  if (value === null || value === undefined) {
+    return [];
+  }
+
+  if (typeof value === "object") {
+    return Object.values(value)
+      .flat()
+      .map((x) => String(x).trim())
+      .filter(Boolean);
+  }
+
+  const text = String(value).trim();
+  if (!text) return [];
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.map((x) => String(x).trim()).filter(Boolean);
+    }
+  } catch (_) {}
+
+  return text
+    .replace(/\r/g, "\n")
+    .split(/\n|;/)
+    .map((x) => x.replace(/^[-•*]\s*/, "").trim())
+    .filter(Boolean);
+}
 
 function App() {
   const [currentPage, setCurrentPage] = useState("pantry");
@@ -864,6 +890,7 @@ function App() {
   const [ocrProgress, setOcrProgress] = useState(0);
 
   const recognitionRef = useRef(null);
+  const assistantTranslationCacheRef = useRef({});
   const ocrWorkerRef = useRef(null);
 
   async function openRecipeAssistant(
@@ -873,14 +900,14 @@ function App() {
   ) {
     const requestedLanguage = languageOverride || assistantLanguage;
 
-    if (!recipe?.recipe_id) {
+    if (!recipe?.recipe_id && !recipe?.recipe_name) {
       setAssistantError("The selected recipe does not have a valid recipe ID.");
       return;
     }
 
     const sourceRecipe = {
-      recipe_id: recipe.recipe_id,
-      recipe_name: recipe.recipe_name,
+      recipe_id: recipe.recipe_id || "",
+      recipe_name: recipe.recipe_name || "",
     };
 
     if (rememberSource) {
@@ -991,7 +1018,7 @@ function App() {
     // If a recipe is open, ALWAYS translate the original Mealora recipe.
     // Do not use assistantRecipe.recipe_name because Gemini may already have
     // translated it into Telugu/Tamil/etc.
-    if (assistantSourceRecipe?.recipe_id) {
+    if (assistantSourceRecipe?.recipe_id || assistantSourceRecipe?.recipe_name) {
       await openRecipeAssistant(
         assistantSourceRecipe,
         language,
@@ -1135,12 +1162,45 @@ function App() {
 
     window.speechSynthesis.cancel();
 
+    function speechText(value) {
+      return String(value || "")
+        // Common cooking units — prevent letter-by-letter reading.
+        .replace(/\bC[\s.-]*U[\s.-]*P(?:S)?\b/gi, "cups")
+        .replace(/\bT[\s.-]*B[\s.-]*S[\s.-]*P\b/gi, "tablespoon")
+        .replace(/\bT[\s.-]*S[\s.-]*P\b/gi, "teaspoon")
+        .replace(/\bTBSP\b/gi, "tablespoon")
+        .replace(/\bTSP\b/gi, "teaspoon")
+        .replace(/\bKG\b/gi, "kilograms")
+        .replace(/\bG\b/gi, "grams")
+        .replace(/\bML\b/gi, "milliliters")
+        .replace(/\bL\b/gi, "liters")
+        .replace(/\bOZ\b/gi, "ounces")
+        .replace(/\bLB\b/gi, "pounds")
+        // Common fraction symbols.
+        .replace(/½/g, " one half ")
+        .replace(/¼/g, " one quarter ")
+        .replace(/¾/g, " three quarters ")
+        .replace(/⅓/g, " one third ")
+        .replace(/⅔/g, " two thirds ")
+        .replace(/⅛/g, " one eighth ")
+        .replace(/⅜/g, " three eighths ")
+        .replace(/⅝/g, " five eighths ")
+        .replace(/⅞/g, " seven eighths ")
+        // Prevent short ALL-CAPS words from being spelled out.
+        .replace(/\b([A-Z]{2,5})\b/g, (match) => match.toLowerCase())
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    const ingredients = normalizeRecipeLines(assistantRecipe.ingredients);
+    const instructions = normalizeRecipeLines(assistantRecipe.instructions);
+
     const text = [
-      assistantRecipe.recipe_name,
+      speechText(assistantRecipe.recipe_name),
       "Ingredients.",
-      ...(assistantRecipe.ingredients || []),
+      ...ingredients.map(speechText),
       "Instructions.",
-      ...(assistantRecipe.instructions || []),
+      ...instructions.map(speechText),
     ].join(". ");
 
     const utterance = new SpeechSynthesisUtterance(text);
@@ -1158,6 +1218,8 @@ function App() {
 
     utterance.lang = voiceLanguageMap[assistantLanguage] || "en-IN";
     utterance.rate = 0.9;
+    utterance.pitch = 1;
+
     window.speechSynthesis.speak(utterance);
   }
 
@@ -1293,6 +1355,13 @@ function App() {
         latitude: coords?.latitude ?? null,
         longitude: coords?.longitude ?? null,
         mode: autoMode ? "automatic" : "custom",
+        pantry: pantryItems.map((item) => ({
+          ingredient_name: item.ingredient_name || "",
+          normalized_name: item.normalized_name || "",
+          quantity: item.quantity ?? null,
+          unit: item.unit || "",
+          expiry_date: item.expiry_date || null,
+        })),
       };
 
       if (autoMode) {
@@ -1347,6 +1416,26 @@ function App() {
       loadLiveContext();
     }
   }, [currentPage, autoMode]);
+
+  async function resetPantryForWeek() {
+    const { error: deleteError } = await supabase
+      .from("pantry_items")
+      .delete()
+      .not("id", "is", null);
+
+    if (deleteError) {
+      console.error("Error resetting pantry:", deleteError);
+      setError(
+        "Unable to reset the pantry. Check your Supabase pantry_items DELETE policy."
+      );
+      return;
+    }
+
+    setPantryItems([]);
+    setSuccessMessage(
+      "Pantry reset completed. Add the ingredients you currently have before generating the next weekly plan."
+    );
+  }
 
   async function fetchPantryItems() {
     setLoading(true);
@@ -4870,9 +4959,9 @@ function App() {
                       <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginTop: "16px" }}>
                         {[
                           ["Pantry match", `${(Number(recipe.pantry_score || 0) * 100).toFixed(0)}%`],
-                          ["Expiry score", `${(Number(recipe.expiry_score || 0) * 100).toFixed(0)}%`],
-                          ["Content match", `${(Number(recipe.content_score || 0) * 100).toFixed(0)}%`],
-                          ["ML suitability", `${(Number(recipe.hgb_suitability_score || recipe.rf_suitability_score || 0) * 100).toFixed(0)}%`],
+                          ["Expiry priority", `${(Number(recipe.expiry_score || 0) * 100).toFixed(0)}%`],
+                          ["Location match", `${(Number(recipe.location_match ?? recipe.location_score ?? 0) * 100).toFixed(0)}%`],
+                          ["Overall fit", `${(Number(recipe.final_score || 0) * 100).toFixed(0)}%`],
                         ].map(([label, value]) => (
                           <div key={label} style={{ padding: "10px", borderRadius: "10px", background: "#f8fafc" }}>
                             <small style={{ color: "#64748b" }}>{label}</small>
@@ -4880,34 +4969,6 @@ function App() {
                           </div>
                         ))}
                       </div>
-
-                      {recipe.nutrition_available ? (
-                        <div style={{ marginTop: "12px", padding: "14px", borderRadius: "12px", background: "#f0fdf4", border: "1px solid #dcfce7" }}>
-                          <strong>🥗 Nutrition per serving</strong>
-                          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginTop: "10px", fontSize: "12px", color: "#475569" }}>
-                            <span>Calories: <b>{Number(recipe.calories || 0).toFixed(0)} kcal</b></span>
-                            <span>Protein: <b>{Number(recipe.protein || 0).toFixed(1)} g</b></span>
-                            <span>Carbohydrates: <b>{Number(recipe.carbohydrates || 0).toFixed(1)} g</b></span>
-                            <span>Fat: <b>{Number(recipe.fat || 0).toFixed(1)} g</b></span>
-                            <span>Fibre: <b>{Number(recipe.fibre || 0).toFixed(1)} g</b></span>
-                            <span>Sodium: <b>{Number(recipe.sodium || 0).toFixed(0)} mg</b></span>
-                          </div>
-                        </div>
-                      ) : null}
-
-                      {recipe.nutrition_available ? (
-                        <div style={{ marginTop: "12px", padding: "14px", borderRadius: "12px", background: "#f0fdf4", border: "1px solid #dcfce7" }}>
-                          <strong>🥗 Nutrition per serving</strong>
-                          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginTop: "10px", fontSize: "12px", color: "#475569" }}>
-                            <span>Calories: <b>{Number(recipe.calories || 0).toFixed(0)} kcal</b></span>
-                            <span>Protein: <b>{Number(recipe.protein || 0).toFixed(1)} g</b></span>
-                            <span>Carbohydrates: <b>{Number(recipe.carbohydrates || 0).toFixed(1)} g</b></span>
-                            <span>Fat: <b>{Number(recipe.fat || 0).toFixed(1)} g</b></span>
-                            <span>Fibre: <b>{Number(recipe.fibre || 0).toFixed(1)} g</b></span>
-                            <span>Sodium: <b>{Number(recipe.sodium || 0).toFixed(0)} mg</b></span>
-                          </div>
-                        </div>
-                      ) : null}
 
                       {recipe.nutrition_available ? (
                         <div style={{ marginTop: "12px", padding: "14px", borderRadius: "12px", background: "#f0fdf4", border: "1px solid #dcfce7" }}>
@@ -4989,9 +5050,9 @@ function App() {
                             color: "#64748b",
                           }}
                         >
-                          Based on Mealora's hybrid ranking signals:
-                          pantry, expiry, context, time, weather,
-                          festival, location and ML suitability.
+                          Ranked with pantry availability as the primary
+                          priority, followed by expiry, context, recipe
+                          similarity and learned model signals.
                         </div>
                       </div>
 
@@ -5014,14 +5075,20 @@ function App() {
 
         {currentPage === "leftovers" && (
           <section className="section-card" style={{ marginTop: "24px" }}>
-            <LeftoverDonation pantryItems={pantryItems} />
+            <LeftoverDonation
+              pantryItems={pantryItems}
+              onOpenRecipe={openRecipeAssistant}
+            />
           </section>
         )}
 
         {currentPage === "planner" && (
           <section className="section-card" style={{ marginTop: "24px" }}>
             <WeeklyMealPlanner
-              onOpenRecipe={openRecipeAssistant} pantryItems={pantryItems} />
+              onOpenRecipe={openRecipeAssistant}
+              onResetPantry={resetPantryForWeek}
+              pantryItems={pantryItems}
+            />
           </section>
         )}
 
@@ -5238,7 +5305,7 @@ function App() {
               <section style={{ marginTop: "22px" }}>
                 <h3>🧺 Ingredients</h3>
                 <ul style={{ lineHeight: 1.7, paddingLeft: "22px" }}>
-                  {(assistantRecipe.ingredients || []).map((item, index) => (
+                  {normalizeRecipeLines(assistantRecipe.ingredients).map((item, index) => (
                     <li key={index}>{item}</li>
                   ))}
                 </ul>
@@ -5247,7 +5314,7 @@ function App() {
               <section style={{ marginTop: "22px" }}>
                 <h3>👩‍🍳 Instructions</h3>
                 <ol style={{ lineHeight: 1.8, paddingLeft: "22px" }}>
-                  {(assistantRecipe.instructions || []).map((item, index) => (
+                  {normalizeRecipeLines(assistantRecipe.instructions).map((item, index) => (
                     <li key={index} style={{ marginBottom: "8px" }}>{item}</li>
                   ))}
                 </ol>

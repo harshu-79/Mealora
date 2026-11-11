@@ -1,0 +1,1421 @@
+import os
+import re
+import joblib
+import numpy as np
+import pandas as pd
+
+from scipy.sparse import load_npz
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# ============================================================
+# FILE PATHS
+# ============================================================
+
+BASE = "datasets/processed"
+
+RECIPES = os.path.join(
+    BASE,
+    "recipe_master_dataset.csv"
+)
+
+NUTRITION = os.path.join(
+    BASE,
+    "recipe_master_dataset_nutrition_CLEAN.csv"
+)
+
+FEATURES = os.path.join(
+    BASE,
+    "recipe_feature_matrix.npz"
+)
+
+PANTRY = os.path.join(
+    BASE,
+    "recipe_pantry_features.csv"
+)
+
+EXPIRY = os.path.join(
+    BASE,
+    "recipe_expiry_features.csv"
+)
+
+INTERACTIONS = os.path.join(
+    BASE,
+    "user_recipe_interactions.csv"
+)
+
+RF_MODEL_CANDIDATES = [
+    os.path.join(BASE, "mealora_rf_model.joblib"),
+    os.path.join(BASE, "mealora_ml_models", "mealora_selected_ml_model.joblib"),
+]
+
+HAN_SCORES = os.path.join(
+    BASE,
+    "han_model",
+    "han_recipe_scores.csv"
+)
+
+
+# ============================================================
+# RANDOM FOREST FEATURES
+# ============================================================
+
+RF_FEATURES = [
+    "pantry_match_pct",
+    "missing_ingredient_count",
+    "expiry_score",
+    "meal_match",
+    "diet_match",
+    "cuisine_match",
+    "time_match",
+    "context_score",
+    "ingredient_count",
+    "cooking_time_minutes",
+]
+
+
+# ============================================================
+# LOAD RANDOM FOREST MODEL
+# ============================================================
+
+print("\nLoading Mealora ML model...")
+
+RF_FEATURES = [
+    "pantry_match_pct",
+    "missing_ingredient_count",
+    "expiry_score",
+    "meal_match",
+    "diet_match",
+    "cuisine_match",
+    "time_match",
+    "context_score",
+    "ingredient_count",
+    "cooking_time_minutes",
+]
+
+try:
+    RF_MODEL = next((path for path in RF_MODEL_CANDIDATES if os.path.exists(path)), RF_MODEL_CANDIDATES[0])
+    saved_object = joblib.load(RF_MODEL)
+except Exception as exc:
+    saved_object = None
+    print("RF model could not be loaded at import time:", exc)
+
+if isinstance(saved_object, dict):
+    rf_model = saved_object.get("model")
+    rf_features = saved_object.get("features", RF_FEATURES)
+    rf_model_name = saved_object.get("model_name", "Random Forest")
+else:
+    rf_model = saved_object
+    rf_features = RF_FEATURES
+    rf_model_name = "Random Forest"
+
+if rf_model is not None:
+    print("Loaded selected ML model:", rf_model_name)
+    print("RF ranking features:", rf_features)
+else:
+    print("WARNING: Random Forest model is unavailable. Candidate ranking will use base score until the model is trained.")
+
+
+# ============================================================
+# RECOMMENDATION FUNCTION
+# ============================================================
+
+# ============================================================
+# AUTOMATIC CONTEXT HELPERS
+# ============================================================
+
+def _norm_text(value):
+    return str(value or "").strip().lower()
+
+
+# ============================================================
+# LIVE PANTRY MATCHING
+# ============================================================
+# The recommendation page owns the real pantry state in Supabase.
+# The old recipe_pantry_features.csv is a static snapshot and can
+# become stale when the user adds/edits/deletes pantry items.
+# These helpers calculate pantry coverage from the CURRENT pantry
+# sent by the frontend for every recommendation request.
+# ============================================================
+
+def _clean_live_ingredient(value):
+    text = _norm_text(value)
+    if not text:
+        return ""
+
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(
+        r"\b(finely|roughly|thinly|thickly|chopped|sliced|diced|minced|grated|crushed|ground|fresh|small|medium|large|optional|to taste|as needed)\b",
+        " ",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" ,.-")
+
+    singular = {
+        "potatoes": "potato", "tomatoes": "tomato", "onions": "onion",
+        "carrots": "carrot", "cucumbers": "cucumber",
+        "capsicums": "capsicum", "brinjals": "brinjal",
+        "eggplants": "eggplant", "apples": "apple", "bananas": "banana",
+        "oranges": "orange", "mangoes": "mango", "eggs": "egg",
+        "lemons": "lemon", "limes": "lime", "chillies": "chilli",
+        "chilies": "chilli", "peppers": "pepper",
+    }
+    return singular.get(text, text)
+
+
+def _live_recipe_ingredients(value):
+    if isinstance(value, list):
+        parts = value
+    else:
+        text = str(value or "").strip()
+        if not text or text.lower() in {"nan", "none", "null"}:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                import ast
+                parsed = ast.literal_eval(text)
+                parts = parsed if isinstance(parsed, list) else [text]
+            except Exception:
+                parts = [text]
+        else:
+            parts = re.split(r"\n|;|\|", text)
+            if len(parts) == 1:
+                parts = [x.strip() for x in text.split(",")]
+
+    cleaned = []
+    for part in parts:
+        value = _clean_live_ingredient(part)
+        # Remove a leading recipe quantity/unit such as "2 cups rice".
+        value = re.sub(
+            r"^\s*(?:\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|\\d+/\\d+)\s*"
+            r"(?:kg|kgs|g|gram|grams|l|litre|litres|ml|cup|cups|tbsp|tablespoon|tablespoons|tsp|teaspoon|teaspoons|piece|pieces|pc|pcs|dozen)?\s*(?:of\s+)?",
+            "",
+            value,
+            flags=re.I,
+        )
+        value = re.sub(r"\s+", " ", value).strip(" ,.-")
+        if value:
+            cleaned.append(value)
+    return list(dict.fromkeys(cleaned))
+
+
+def _live_token_set(value):
+    return set(re.findall(r"[a-z0-9]+", _clean_live_ingredient(value)))
+
+
+def _live_stem(token):
+    token = str(token or "").strip().lower()
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 4 and token.endswith("es"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _build_live_pantry_scores(df, pantry_items):
+    """Calculate pantry coverage from the user's CURRENT pantry state."""
+    pantry_items = pantry_items or []
+    pantry_names = []
+
+    for item in pantry_items:
+        if isinstance(item, str):
+            name = item
+        else:
+            name = item.get("normalized_name") or item.get("ingredient_name") or item.get("name")
+        cleaned = _clean_live_ingredient(name)
+        if cleaned:
+            pantry_names.append(cleaned)
+
+    pantry_names = list(dict.fromkeys(pantry_names))
+
+    if not pantry_names:
+        return None
+
+    stop = {
+        "curry", "masala", "powder", "paste", "leaves", "leaf",
+        "fresh", "dried", "dry", "whole", "ground", "chopped",
+        "sliced", "small", "large", "medium", "recipe",
+    }
+
+    pantry_exact = {name: name for name in pantry_names}
+    pantry_tokens = {}
+    for name in pantry_names:
+        for token in _live_token_set(name):
+            stem = _live_stem(token)
+            if len(stem) >= 3 and stem not in stop:
+                pantry_tokens.setdefault(stem, set()).add(name)
+
+    def find_match(recipe_ing):
+        recipe = _clean_live_ingredient(recipe_ing)
+        if not recipe:
+            return None
+        if recipe in pantry_exact:
+            return pantry_exact[recipe]
+
+        recipe_tokens = {_live_stem(t) for t in _live_token_set(recipe)} - stop
+        candidates = set()
+        for token in recipe_tokens:
+            candidates.update(pantry_tokens.get(token, set()))
+
+        if not candidates:
+            return None
+
+        best = None
+        best_score = 0.0
+        for pantry_name in candidates:
+            pantry_tok = {_live_stem(t) for t in _live_token_set(pantry_name)} - stop
+            overlap = len(recipe_tokens & pantry_tok)
+            score = overlap / max(len(recipe_tokens), 1)
+            if recipe in pantry_name or pantry_name in recipe:
+                score = max(score, 1.0)
+            if score > best_score:
+                best_score = score
+                best = pantry_name
+        return best if best_score >= 0.5 else None
+
+    scores = []
+    missing_counts = []
+    matched_lists = []
+    missing_lists = []
+
+    ingredient_column = next(
+        (c for c in ["ingredients", "ingredient_names", "ingredient_list", "Cleaned-Ingredients", "TranslatedIngredients"] if c in df.columns),
+        None,
+    )
+
+    if ingredient_column is None:
+        raise RuntimeError("Recipe dataset has no ingredient column for live pantry matching.")
+
+    for value in df[ingredient_column].tolist():
+        ingredients = _live_recipe_ingredients(value)
+        if not ingredients:
+            scores.append(0.0)
+            missing_counts.append(0)
+            matched_lists.append([])
+            missing_lists.append([])
+            continue
+
+        matched = []
+        missing = []
+        for ingredient in ingredients:
+            match = find_match(ingredient)
+            if match:
+                matched.append(match)
+            else:
+                missing.append(ingredient)
+
+        coverage = len(matched) / max(len(ingredients), 1)
+        scores.append(float(np.clip(coverage, 0.0, 1.0)))
+        missing_counts.append(len(missing))
+        matched_lists.append(list(dict.fromkeys(matched)))
+        missing_lists.append(missing)
+
+    return {
+        "pantry_score": pd.Series(scores, index=df.index),
+        "missing_ingredient_count": pd.Series(missing_counts, index=df.index, dtype=float),
+        "matched_pantry": matched_lists,
+        "missing_ingredients": missing_lists,
+        "pantry_item_count": len(pantry_names),
+    }
+
+
+def _keyword_score(df, keywords):
+    """
+    Returns a soft 0..1 score based on recipe text.
+    Used for weather/festival signals without changing the
+    trained 10-feature HGB input.
+    """
+    text_cols = [
+        c for c in [
+            "recipe_name", "ingredients", "ingredient_names",
+            "instructions", "cuisine", "diet", "meal_type"
+        ]
+        if c in df.columns
+    ]
+
+    if not text_cols:
+        return pd.Series(0.0, index=df.index)
+
+    combined = (
+        df[text_cols]
+        .fillna("")
+        .astype(str)
+        .agg(" ".join, axis=1)
+        .str.lower()
+    )
+
+    hits = np.zeros(len(df), dtype=float)
+    for keyword, weight in keywords:
+        hits += combined.str.contains(
+            re.escape(keyword.lower()), regex=True, na=False
+        ).astype(float).to_numpy() * float(weight)
+
+    return pd.Series(np.clip(hits, 0.0, 1.0), index=df.index)
+
+
+def _automatic_context_scores(df, weather=None, festival=None, location=None):
+    weather = weather or {}
+    festival = festival or {}
+    location = location or {}
+
+    condition = _norm_text(weather.get("condition"))
+    temperature = weather.get("temperature")
+    festival_name = _norm_text(festival.get("name"))
+
+    weather_score = pd.Series(0.0, index=df.index)
+
+    # Warm/rainy/cold weather food affinity.
+    if "rain" in condition or "drizzle" in condition or "thunder" in condition:
+        weather_score = _keyword_score(df, [
+            ("rasam", 1.0), ("soup", 1.0), ("sambar", 0.8),
+            ("khichdi", 0.9), ("tea", 0.6), ("pakora", 0.7),
+            ("curry", 0.5), ("stew", 0.8)
+        ])
+    elif "snow" in condition or "cold" in condition:
+        weather_score = _keyword_score(df, [
+            ("soup", 1.0), ("stew", 1.0), ("rasam", 0.8),
+            ("khichdi", 0.9), ("curry", 0.7)
+        ])
+    else:
+        try:
+            temp = float(temperature)
+        except (TypeError, ValueError):
+            temp = None
+
+        if temp is not None and temp >= 32:
+            weather_score = _keyword_score(df, [
+                ("salad", 1.0), ("raita", 0.9), ("buttermilk", 0.9),
+                ("lassi", 0.9), ("lemon", 0.7), ("coconut", 0.6),
+                ("juice", 0.8)
+            ])
+        elif temp is not None and temp <= 20:
+            weather_score = _keyword_score(df, [
+                ("soup", 1.0), ("rasam", 0.8), ("khichdi", 0.9),
+                ("stew", 0.9), ("curry", 0.7)
+            ])
+
+    festival_score = pd.Series(0.0, index=df.index)
+
+    festival_keywords = {
+        "diwali": [
+            ("laddu", 1.0), ("ladoo", 1.0), ("halwa", 0.9),
+            ("barfi", 1.0), ("kheer", 0.9), ("gulab jamun", 0.9),
+            ("jalebi", 0.9), ("sweet", 0.7), ("chakli", 0.7),
+            ("murukku", 0.7), ("mixture", 0.6)
+        ],
+        "ganesh": [
+            ("modak", 1.0), ("kozhukattai", 1.0),
+            ("laddu", 0.9), ("ladoo", 0.9), ("sweet", 0.6)
+        ],
+        "pongal": [
+            ("pongal", 1.0), ("sweet pongal", 1.0),
+            ("ven pongal", 1.0), ("sakkarai pongal", 1.0),
+            ("sambar", 0.5), ("coconut", 0.4)
+        ],
+        "makar sankranti": [
+            ("til", 0.9), ("sesame", 0.9), ("jaggery", 0.9),
+            ("pongal", 0.9), ("sweet", 0.7)
+        ],
+        "onam": [
+            ("sadya", 1.0), ("avial", 1.0), ("payasam", 0.9),
+            ("thoran", 0.9), ("olan", 0.9), ("parippu", 0.7),
+            ("kalan", 0.8), ("pachadi", 0.8)
+        ],
+        "raksha": [
+            ("laddu", 0.9), ("ladoo", 0.9), ("kheer", 0.8),
+            ("barfi", 1.0), ("sweet", 0.7)
+        ],
+        "holi": [
+            ("gujiya", 1.0), ("thandai", 1.0), ("malpua", 0.9),
+            ("dahi vada", 0.8), ("sweet", 0.7)
+        ],
+        "janmashtami": [
+            ("makhan", 1.0), ("mishri", 1.0), ("poha", 0.7),
+            ("sabudana", 0.9), ("kuttu", 0.9), ("singhara", 0.9),
+            ("panjiri", 1.0), ("peda", 0.9), ("ladoo", 0.8),
+            ("laddoo", 0.8), ("kheer", 0.8), ("sweet", 0.6)
+        ],
+        "krishna": [
+            ("makhan", 1.0), ("mishri", 1.0), ("peda", 0.9),
+            ("panjiri", 1.0), ("ladoo", 0.8), ("kheer", 0.8)
+        ],
+        "navratri": [
+            ("sabudana", 1.0), ("kuttu", 0.9), ("singhara", 0.9),
+            ("samak", 0.9), ("vrat", 1.0), ("rajgira", 0.9),
+            ("farali", 1.0)
+        ],
+        "shivaratri": [
+            ("sabudana", 0.9), ("kuttu", 0.9), ("singhara", 0.9),
+            ("rajgira", 0.9), ("vrat", 1.0), ("fruit", 0.6)
+        ],
+        "ugadi": [
+            ("pulihora", 0.9), ("pachadi", 1.0), ("bobbatlu", 1.0),
+            ("obattu", 1.0), ("holige", 1.0), ("payasam", 0.8)
+        ],
+        "gudi padwa": [
+            ("puran poli", 1.0), ("shrikhand", 0.9), ("poori", 0.6),
+            ("sweet", 0.6)
+        ],
+        "eid": [
+            ("biryani", 0.8), ("sheer khurma", 1.0),
+            ("korma", 0.9), ("sewai", 1.0), ("kebab", 0.7),
+            ("haleem", 0.9), ("nihari", 0.8)
+        ],
+        "ramzan": [
+            ("biryani", 0.8), ("haleem", 1.0), ("kebab", 0.8),
+            ("sewai", 0.9), ("samosa", 0.6)
+        ],
+        "rath yatra": [
+            ("khichdi", 0.8), ("mahaprasad", 1.0),
+            ("dalma", 1.0), ("sweet", 0.6)
+        ],
+        "guru purnima": [
+            ("kheer", 0.8), ("halwa", 0.8), ("sweet", 0.7)
+        ],
+
+        "dussehra": [
+            ("poori", 0.6), ("halwa", 0.8), ("sweet", 0.7),
+            ("kheer", 0.7)
+        ],
+        "durga": [
+            ("khichdi", 0.8), ("labra", 1.0), ("payesh", 1.0),
+            ("luchi", 0.9), ("sandesh", 1.0), ("sweet", 0.7)
+        ],
+        "navami": [
+            ("puri", 0.6), ("halwa", 0.8), ("chana", 0.8),
+            ("sweet", 0.6)
+        ],
+        "chhath": [
+            ("thekua", 1.0), ("kheer", 0.8), ("rasiyaw", 1.0),
+            ("rice", 0.5), ("jaggery", 0.7)
+        ],
+        "guru nanak": [
+            ("langar", 1.0), ("dal", 0.8), ("roti", 0.7),
+            ("halwa", 0.8), ("kheer", 0.7)
+        ],
+        "buddha": [
+            ("kheer", 0.9), ("payasam", 0.8), ("sweet", 0.6)
+        ],
+        "ravi": [
+            ("puran poli", 0.8), ("sweet", 0.6)
+        ],
+        "baisakhi": [
+            ("makki", 0.8), ("sarson", 0.9), ("lassi", 0.7),
+            ("paratha", 0.7)
+        ],
+        "lohri": [
+            ("til", 0.9), ("sesame", 0.9), ("jaggery", 1.0),
+            ("gajak", 1.0), ("rewri", 1.0), ("makki", 0.7)
+        ],
+        "maha": [
+            ("sabudana", 0.8), ("vrat", 0.9), ("kuttu", 0.8),
+            ("singhara", 0.8)
+        ],
+    }
+
+    for festival_key, keywords in festival_keywords.items():
+        if festival_key in festival_name:
+            festival_score = _keyword_score(df, keywords)
+            break
+
+    # Location-aware scoring. The backend normally supplies a
+    # cuisine_hint, but accepting the city here makes the ranker
+    # robust for both API and direct Python calls.
+    location_score = pd.Series(0.0, index=df.index)
+
+    city = _norm_text(
+        location.get("city")
+        or location.get("location_city")
+        or location.get("name")
+        or location.get("location_name")
+    )
+
+    location_cuisine = _norm_text(location.get("cuisine_hint"))
+
+    city_cuisine = {
+        "chennai": "south indian",
+        "coimbatore": "south indian",
+        "madurai": "south indian",
+        "trichy": "south indian",
+        "tiruchirappalli": "south indian",
+        "salem": "south indian",
+        "hyderabad": "andhra",
+        "vijayawada": "andhra",
+        "visakhapatnam": "andhra",
+        "bengaluru": "south indian",
+        "bangalore": "south indian",
+        "mysore": "south indian",
+        "mysuru": "south indian",
+        "kochi": "kerala",
+        "thiruvananthapuram": "kerala",
+        "trivandrum": "kerala",
+        "mumbai": "maharashtrian",
+        "pune": "maharashtrian",
+        "kolkata": "bengali",
+        "jaipur": "rajasthani",
+        "udaipur": "rajasthani",
+        "lucknow": "north indian",
+        "delhi": "north indian",
+        "new delhi": "north indian",
+    }
+
+    if not location_cuisine and city:
+        location_cuisine = city_cuisine.get(city, "")
+
+    if location_cuisine:
+        location_score = _keyword_score(
+            df,
+            [(location_cuisine, 1.0)]
+        )
+
+    return weather_score, festival_score, location_score
+
+
+
+def recommend(
+    reference_recipe="Balu shahi",
+    target_user=1,
+    top_k=5,
+    meal_type="Dinner",
+    diet="Vegetarian",
+    cuisine="South Indian",
+    max_time=30,
+    weather=None,
+    festival=None,
+    location=None,
+    pantry_items=None,
+):
+
+    # --------------------------------------------------------
+    # LOAD DATA
+    # --------------------------------------------------------
+
+    df = pd.read_csv(
+        RECIPES,
+        low_memory=False
+    )
+
+    X = load_npz(FEATURES)
+
+    pantry = pd.read_csv(PANTRY)
+
+    expiry = pd.read_csv(EXPIRY)
+
+    print(
+        "Recipes loaded:",
+        len(df)
+    )
+
+    # --------------------------------------------------------
+    # MERGE HAN GRAPH SCORES
+    # --------------------------------------------------------
+    original_recipe_count = len(df)
+    if os.path.exists(HAN_SCORES):
+        print("\nMerging HAN graph scores...")
+        han = pd.read_csv(HAN_SCORES, low_memory=False)
+        if "recipe_id" in df.columns and "recipe_id" in han.columns:
+            han_small = han[["recipe_id", "han_score"]].drop_duplicates("recipe_id")
+            df = df.merge(han_small, on="recipe_id", how="left", validate="one_to_one")
+        elif "recipe_name" in df.columns and "recipe_name" in han.columns:
+            han_small = han[["recipe_name", "han_score"]].drop_duplicates("recipe_name")
+            df = df.merge(han_small, on="recipe_name", how="left", validate="many_to_one")
+        else:
+            df["han_score"] = 0.5
+        if len(df) != original_recipe_count:
+            raise RuntimeError("HAN merge changed the recipe count. Duplicate recipe rows were created.")
+        df["han_score"] = pd.to_numeric(df["han_score"], errors="coerce").fillna(0.5).clip(0, 1)
+        print("HAN scores merged:", len(han))
+    else:
+        df["han_score"] = 0.5
+        print("WARNING: HAN score file not found. Using neutral HAN score 0.5.")
+
+    # --------------------------------------------------------
+    # PANTRY FEATURES — LIVE CURRENT PANTRY FIRST
+    # --------------------------------------------------------
+    # The previous implementation merged recipe_pantry_features.csv,
+    # which is a static snapshot. That is why the UI could show a large
+    # current pantry while recommendations still had 15–20% pantry
+    # coverage. The recommendation request now sends the actual pantry
+    # rows from Supabase, so calculate coverage from that live state.
+
+    live_pantry = _build_live_pantry_scores(df, pantry_items)
+
+    if live_pantry is not None:
+        print(
+            "LIVE pantry received:",
+            live_pantry["pantry_item_count"],
+            "items"
+        )
+        df["pantry_score"] = live_pantry["pantry_score"]
+        df["pantry_match_pct"] = live_pantry["pantry_score"]
+        df["missing_ingredient_count"] = live_pantry["missing_ingredient_count"]
+        df["matched_pantry"] = live_pantry["matched_pantry"]
+        df["missing_ingredients"] = live_pantry["missing_ingredients"]
+    else:
+        print("WARNING: No live pantry supplied. Falling back to static pantry features.")
+        pantry_columns = [
+            "recipe_id",
+            "pantry_match_pct",
+            "missing_ingredient_count",
+        ]
+        available_pantry_columns = [
+            col for col in pantry_columns if col in pantry.columns
+        ]
+        pantry_merge = pantry[available_pantry_columns].copy()
+        df = df.merge(pantry_merge, on="recipe_id", how="left")
+
+        if "pantry_match_pct" not in df.columns:
+            df["pantry_match_pct"] = 0.0
+        if "missing_ingredient_count" not in df.columns:
+            df["missing_ingredient_count"] = 0.0
+
+        df["pantry_match_pct"] = pd.to_numeric(
+            df["pantry_match_pct"], errors="coerce"
+        ).fillna(0)
+        df["missing_ingredient_count"] = pd.to_numeric(
+            df["missing_ingredient_count"], errors="coerce"
+        ).fillna(0)
+        df["pantry_score"] = df["pantry_match_pct"].clip(0, 1)
+        df["matched_pantry"] = [[] for _ in range(len(df))]
+        df["missing_ingredients"] = [[] for _ in range(len(df))]
+
+    # --------------------------------------------------------
+    # REFERENCE RECIPE
+    # --------------------------------------------------------
+
+    matches = df[
+        df["recipe_name"]
+        .fillna("")
+        .str.contains(
+            reference_recipe,
+            case=False,
+            na=False,
+            regex=False
+        )
+    ]
+
+    if matches.empty:
+        raise ValueError(
+            f"Reference recipe not found: "
+            f"{reference_recipe}"
+        )
+
+    ref_idx = matches.index[0]
+
+    print(
+        "Reference recipe:",
+        df.loc[
+            ref_idx,
+            "recipe_name"
+        ]
+    )
+
+    # ========================================================
+    # 1. TF-IDF + COSINE SIMILARITY
+    # ========================================================
+
+    print(
+        "\nCalculating content similarity..."
+    )
+
+    content_scores = cosine_similarity(
+        X[ref_idx],
+        X
+    ).flatten()
+
+    df["content_score"] = content_scores
+
+    # ========================================================
+    # 2. CONTENT-BASED RECOMMENDATION
+    # ========================================================
+
+    # Mealora is a single-user application.
+    # No collaborative or multi-user score is used.
+    df["personal_behavior_score"] = 0.0
+
+    # Content similarity is the primary recipe similarity signal.
+    df["hybrid_score"] = df["content_score"]
+
+    # ========================================================
+    # 4. PANTRY COMPATIBILITY
+    # ========================================================
+
+    print(
+        "Using live pantry compatibility calculated from the current pantry state..."
+    )
+
+    df["pantry_score"] = pd.to_numeric(
+        df["pantry_score"], errors="coerce"
+    ).fillna(0).clip(0, 1)
+
+    # ========================================================
+    # 5. EXPIRY SCORE
+    # ========================================================
+
+    print(
+        "Calculating expiry score..."
+    )
+
+    expiry_map = expiry.set_index(
+        "recipe_id"
+    )["expiry_score"]
+
+    df["expiry_score"] = (
+        df["recipe_id"]
+        .map(expiry_map)
+        .fillna(0)
+    )
+
+    df["expiry_score"] = pd.to_numeric(
+        df["expiry_score"],
+        errors="coerce"
+    ).fillna(0)
+
+    df["expiry_score"] = (
+        df["expiry_score"]
+        .clip(
+            lower=0,
+            upper=1
+        )
+    )
+
+    # --------------------------------------------------------
+    # AUTOMATIC REAL-WORLD CONTEXT SCORES
+    # These columns MUST be created before context_score uses them.
+    # --------------------------------------------------------
+    (
+        df["weather_score"],
+        df["festival_score"],
+        df["location_score"],
+    ) = _automatic_context_scores(
+        df,
+        weather=weather,
+        festival=festival,
+        location=location,
+    )
+
+    # Ensure numeric, bounded scores.
+    for _col in ["weather_score", "festival_score", "location_score"]:
+        df[_col] = pd.to_numeric(
+            df[_col], errors="coerce"
+        ).fillna(0).clip(0, 1)
+
+    # ========================================================
+    # 6. DYNAMIC CONTEXT SCORE
+    # ========================================================
+
+    print("\nApplying user context...")
+
+    context = {
+        "meal_type": str(meal_type or "").strip(),
+        "diet": str(diet or "").strip(),
+        "cuisine": str(cuisine or "").strip(),
+        "max_time": max_time,
+    }
+
+    # Normalize text safely
+    meal_text = df["meal_type"].fillna("").astype(str).str.lower().str.strip()
+    diet_column = "diet_type" if "diet_type" in df.columns else ("diet" if "diet" in df.columns else None)
+    if diet_column is None:
+        df["diet_type"] = ""
+        diet_column = "diet_type"
+    diet_text = df[diet_column].fillna("").astype(str).str.lower().str.strip()
+    cuisine_text = df["cuisine"].fillna("").astype(str).str.lower().str.strip()
+
+    requested_meal = context["meal_type"].lower()
+    requested_diet = context["diet"].lower()
+    requested_cuisine = context["cuisine"].lower()
+
+    # --------------------------------------------------------
+    # Meal type match
+    # --------------------------------------------------------
+
+    df["meal_match"] = (
+        meal_text.str.contains(requested_meal, na=False, regex=False)
+        if requested_meal
+        else 1.0
+    )
+    df["meal_match"] = df["meal_match"].astype(float)
+
+    # --------------------------------------------------------
+    # Diet compatibility
+    # --------------------------------------------------------
+
+    # Use explicit recipe labels first.
+    df["diet_match"] = diet_text.str.contains(
+        requested_diet,
+        na=False,
+        regex=False
+    ).astype(float) if requested_diet else 1.0
+
+    # Stronger compatibility rules for common diet requests.
+    if requested_diet in {"vegetarian", "vegan", "jain", "non-vegetarian"}:
+
+        nonveg_pattern = (
+            r"non.?vegetarian|nonveg|chicken|mutton|lamb|"
+            r"beef|pork|fish|prawn|shrimp|crab|meat|egg"
+        )
+
+        dairy_pattern = r"milk|curd|yogurt|yoghurt|paneer|cheese|ghee|butter"
+
+        onion_garlic_pattern = r"onion|garlic"
+
+        if requested_diet == "vegetarian":
+            df["diet_match"] = (
+                ~diet_text.str.contains(
+                    nonveg_pattern,
+                    case=False,
+                    na=False,
+                    regex=True
+                )
+            ).astype(float)
+
+        elif requested_diet == "vegan":
+            df["diet_match"] = (
+                ~(
+                    diet_text.str.contains(
+                        nonveg_pattern,
+                        case=False,
+                        na=False,
+                        regex=True
+                    )
+                    |
+                    diet_text.str.contains(
+                        dairy_pattern,
+                        case=False,
+                        na=False,
+                        regex=True
+                    )
+                )
+            ).astype(float)
+
+        elif requested_diet == "jain":
+            df["diet_match"] = (
+                ~(
+                    diet_text.str.contains(
+                        nonveg_pattern,
+                        case=False,
+                        na=False,
+                        regex=True
+                    )
+                    |
+                    diet_text.str.contains(
+                        onion_garlic_pattern,
+                        case=False,
+                        na=False,
+                        regex=True
+                    )
+                )
+            ).astype(float)
+
+        elif requested_diet == "non-vegetarian":
+            df["diet_match"] = (
+                diet_text.str.contains(
+                    nonveg_pattern,
+                    case=False,
+                    na=False,
+                    regex=True
+                )
+            ).astype(float)
+
+    # --------------------------------------------------------
+    # Cuisine match
+    # --------------------------------------------------------
+
+    df["cuisine_match"] = (
+        cuisine_text.str.contains(
+            requested_cuisine,
+            na=False,
+            regex=False
+        )
+        if requested_cuisine
+        else 1.0
+    )
+    df["cuisine_match"] = df["cuisine_match"].astype(float)
+
+    # --------------------------------------------------------
+    # Cooking time match
+    # --------------------------------------------------------
+
+    time = pd.to_numeric(
+        df["cooking_time_minutes"],
+        errors="coerce"
+    )
+
+    try:
+        max_time_value = float(context["max_time"])
+    except (TypeError, ValueError):
+        max_time_value = 30.0
+
+    # Missing/invalid time is NOT treated as a match.
+    df["time_match"] = (
+        time.notna() & time.le(max_time_value)
+    ).astype(float)
+
+    # --------------------------------------------------------
+    # Context score
+    # --------------------------------------------------------
+
+    # Festival/occasion is intentionally NOT part of the normal
+    # recommendation suitability score. Festive recipes are handled
+    # by Mealora's separate festive-recommendation flow.
+    df["context_score"] = (
+        0.22 * df["meal_match"]
+        + 0.22 * df["diet_match"]
+        + 0.16 * df["cuisine_match"]
+        + 0.15 * df["time_match"]
+        + 0.15 * df["weather_score"]
+        + 0.10 * df["location_score"]
+    )
+
+    print(
+        "Context:",
+        context
+    )
+
+    print(
+        "Context matches:",
+        f"meal={df['meal_match'].sum():.0f},",
+        f"diet={df['diet_match'].sum():.0f},",
+        f"cuisine={df['cuisine_match'].sum():.0f},",
+        f"time={df['time_match'].sum():.0f}"
+    )
+
+    # ========================================================
+    # NUTRITION
+    # ========================================================
+    # IMPORTANT:
+    # Nutrition is DISPLAY-ONLY.
+    #
+    # It does NOT:
+    # - train the recommendation model
+    # - filter candidates
+    # - affect candidate_base_score
+    # - affect final_score
+    #
+    # Nutrition values are attached AFTER the ML ranking below.
+    # ========================================================
+
+    # ========================================================
+    # 7. MULTI-FACTOR CANDIDATE FILTER
+    # ========================================================
+    # IMPORTANT: Random Forest is NOT used to search all 18,568
+    # recipes. The recommendation signals first create an eligible
+    # candidate pool. RF then reranks only that filtered pool.
+
+    if "recipe_scope" in df.columns:
+        result = df[
+            df["recipe_scope"].fillna("").str.lower().eq("indian")
+            & (df.index != ref_idx)
+        ].copy()
+    else:
+        result = df[df.index != ref_idx].copy()
+
+    def apply_constraint(current, mask, label):
+        filtered = current[mask.loc[current.index]].copy()
+        minimum = max(top_k, 5)
+        if len(filtered) >= minimum:
+            print(f"Candidate filter applied: {label} -> {len(filtered)}")
+            return filtered
+        print(f"Candidate filter relaxed: {label} (only {len(filtered)} candidates)")
+        return current
+
+    # All existing recommendation factors participate before RF.
+    if requested_meal:
+        result = apply_constraint(result, df["meal_match"].eq(1), "meal type")
+    if requested_diet:
+        result = apply_constraint(result, df["diet_match"].eq(1), "diet")
+    if requested_cuisine:
+        result = apply_constraint(result, df["cuisine_match"].eq(1), "cuisine")
+    result = apply_constraint(result, df["time_match"].eq(1), "maximum cooking time")
+
+    # Candidate-pool score is retained as a diagnostic/supporting signal.
+    # It is NOT used to decide the final recommendation order.
+    result["candidate_base_score"] = (
+        0.40 * result["pantry_score"]
+        + 0.20 * result["expiry_score"]
+        + 0.15 * result["context_score"]
+        + 0.10 * result["content_score"]
+        + 0.10 * result["time_match"]
+        + 0.05 * result["han_score"]
+    ).clip(0, 1)
+
+    # IMPORTANT:
+    # Do NOT truncate candidates using candidate_base_score.
+    # Pantry priority must be evaluated across the entire eligible pool.
+    # RF is applied to the complete eligible pool before the final
+    # priority ordering.
+    result = result.copy()
+
+    # ========================================================
+    # 8. RANDOM FOREST FINAL RERANKING
+    # ========================================================
+    if rf_model is not None:
+        rf_input = pd.DataFrame(index=result.index)
+        for feature in rf_features:
+            if feature in result.columns:
+                rf_input[feature] = pd.to_numeric(
+                    result[feature], errors="coerce"
+                ).fillna(0.0)
+            else:
+                rf_input[feature] = 0.0
+        rf_input = rf_input[rf_features]
+
+        try:
+            rf_probability = rf_model.predict_proba(rf_input)[:, 1]
+            result["rf_suitability_score"] = np.clip(
+                np.asarray(rf_probability, dtype=float), 0.0, 1.0
+            )
+        except Exception as exc:
+            print("RF reranking failed:", exc)
+            result["rf_suitability_score"] = result["candidate_base_score"]
+    else:
+        result["rf_suitability_score"] = result["candidate_base_score"]
+
+    # ========================================================
+    # 9. PANTRY-FIRST PRIORITY RANKING + OVERALL FIT
+    # ========================================================
+    # Mealora uses a two-part approach:
+    #
+    # A) RANKING ORDER (what decides who is recommended):
+    #    1. Pantry availability
+    #    2. Expiry / food-waste priority
+    #    3. Context suitability
+    #    4. Content similarity
+    #    5. Random Forest suitability
+    #    6. HAN graph score
+    #
+    # This is a lexicographic priority, NOT a weighted average.
+    # A lower-priority signal cannot overturn a higher-priority signal.
+    #
+    # B) OVERALL FIT (what is displayed to the user):
+    #    A cumulative 0..100% suitability summary. Pantry has the
+    #    largest contribution, but the value is NOT used to reorder
+    #    the recommendations.
+    #
+    # Overall-fit weights:
+    #    Pantry 40%, Expiry 20%, Context 15%, Content 10%,
+    #    RF 10%, HAN 5%.
+    #
+    # Nutrition remains completely excluded from both ranking and fit.
+    # ========================================================
+
+    priority_columns = [
+        "pantry_score",
+        "expiry_score",
+        "context_score",
+        "content_score",
+        "rf_suitability_score",
+        "han_score",
+    ]
+
+    # Overall fit is display-only. It must never replace the
+    # pantry-first priority ordering above.
+    result["final_score"] = (
+        0.40 * result["pantry_score"]
+        + 0.20 * result["expiry_score"]
+        + 0.15 * result["context_score"]
+        + 0.10 * result["content_score"]
+        + 0.10 * result["rf_suitability_score"]
+        + 0.05 * result["han_score"]
+    ).clip(0, 1)
+
+    result = result.sort_values(
+        priority_columns,
+        ascending=[False, False, False, False, False, False],
+        kind="mergesort"
+    ).head(top_k).copy()
+
+    # ========================================================
+    # ATTACH NUTRITION FOR DISPLAY ONLY
+    # ========================================================
+    #
+    # IMPORTANT:
+    # Nutrition is attached ONLY AFTER recommendation ranking.
+    #
+    # Nutrition does NOT:
+    # - train the ML model
+    # - filter candidates
+    # - affect candidate_base_score
+    # - affect rf_suitability_score
+    # - affect final_score
+    #
+    # The master recipe dataset already contains nutrition columns,
+    # so remove those columns from the ranked result first.
+    # Then attach the CLEAN nutrition dataset explicitly.
+    # ========================================================
+
+    # Actual nutrition values.
+    # These fields alone determine whether nutrition is available.
+    nutrition_fields = [
+        "calories",
+        "protein",
+        "carbohydrates",
+        "fat",
+        "fibre",
+        "sodium",
+        "calcium",
+        "iron",
+        "vitamin_c",
+        "folate",
+    ]
+
+    # Nutrition metadata is display/audit information only.
+    # Metadata MUST NOT make nutrition_available=True.
+    nutrition_metadata_fields = [
+        "nutrition_source",
+        "nutrition_confidence",
+        "nutrition_coverage_pct",
+    ]
+
+    all_nutrition_display_fields = (
+        nutrition_fields + nutrition_metadata_fields
+    )
+
+    # Remove any nutrition columns inherited from the master dataset.
+    # This prevents pandas _x/_y merge conflicts.
+    result = result.drop(
+        columns=[
+            c for c in nutrition_fields
+            if c in result.columns
+        ],
+        errors="ignore"
+    )
+
+    result["nutrition_available"] = False
+
+    if os.path.exists(NUTRITION):
+
+        try:
+            nutrition_df = pd.read_csv(
+                NUTRITION,
+                low_memory=False
+            )
+
+            if "recipe_id" not in nutrition_df.columns:
+                raise RuntimeError(
+                    "CLEAN nutrition dataset has no recipe_id column."
+                )
+
+            nutrition_df["recipe_id"] = (
+                nutrition_df["recipe_id"]
+                .astype(str)
+                .str.strip()
+            )
+
+            result["_nutrition_recipe_id"] = (
+                result["recipe_id"]
+                .astype(str)
+                .str.strip()
+            )
+
+            # Keep actual nutrition values and metadata that exist.
+            available_nutrition_fields = [
+                c for c in nutrition_fields
+                if c in nutrition_df.columns
+            ]
+
+            available_nutrition_metadata_fields = [
+                c for c in nutrition_metadata_fields
+                if c in nutrition_df.columns
+            ]
+
+            available_nutrition_display_fields = (
+                available_nutrition_fields
+                + available_nutrition_metadata_fields
+            )
+
+            nutrition_small = nutrition_df[
+                ["recipe_id"] + available_nutrition_display_fields
+            ].copy()
+
+            # One row per recipe.
+            nutrition_small = (
+                nutrition_small
+                .drop_duplicates(
+                    subset=["recipe_id"],
+                    keep="first"
+                )
+            )
+
+            # Rename recipe_id so there is no collision with result.recipe_id.
+            nutrition_small = nutrition_small.rename(
+                columns={
+                    "recipe_id": "_nutrition_recipe_id"
+                }
+            )
+
+            result = result.merge(
+                nutrition_small,
+                on="_nutrition_recipe_id",
+                how="left"
+            )
+
+            if available_nutrition_fields:
+
+                # IMPORTANT:
+                # Only actual nutrition values determine availability.
+                # Source/confidence/coverage metadata do NOT count.
+                result["nutrition_available"] = (
+                    result[available_nutrition_fields]
+                    .notna()
+                    .any(axis=1)
+                )
+
+            print(
+                "Nutrition attached for DISPLAY ONLY:",
+                f"{int(result['nutrition_available'].sum())}/{len(result)}"
+            )
+
+            result.drop(
+                columns=["_nutrition_recipe_id"],
+                inplace=True,
+                errors="ignore"
+            )
+
+        except Exception as exc:
+
+            print(
+                "Nutrition display attachment warning:",
+                exc
+            )
+
+            result.drop(
+                columns=["_nutrition_recipe_id"],
+                inplace=True,
+                errors="ignore"
+            )
+
+    else:
+
+        print(
+            "Nutrition display dataset not found:",
+            NUTRITION
+        )
+
+    # Guarantee stable frontend fields even when nutrition is unavailable.
+    for _nutrition_column in all_nutrition_display_fields:
+
+        if _nutrition_column not in result.columns:
+            result[_nutrition_column] = np.nan
+
+    result["nutrition_available"] = (
+        result["nutrition_available"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # ========================================================
+    # RETURN RESULTS
+    # ========================================================
+
+    return result[
+        [
+            "recipe_id",
+            "recipe_name",
+            "content_score",
+            "hybrid_score",
+            "pantry_score",
+            "missing_ingredient_count",
+            "matched_pantry",
+            "missing_ingredients",
+            "expiry_score",
+            "context_score",
+            "time_match",
+            "weather_score",
+            "festival_score",
+            "location_score",
+            "rf_suitability_score",
+            "han_score",
+            "nutrition_available",
+            "calories",
+            "protein",
+            "carbohydrates",
+            "fat",
+            "fibre",
+            "sodium",
+            "calcium",
+            "iron",
+            "vitamin_c",
+            "folate",
+            "nutrition_source",
+            "nutrition_confidence",
+            "nutrition_coverage_pct",
+            "candidate_base_score",
+            "final_score",
+        ]
+    ]
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    result = recommend(
+        reference_recipe="Balu shahi",
+        target_user=1,
+        top_k=5,
+        meal_type="Dinner",
+        diet="Vegetarian",
+        cuisine="South Indian",
+        max_time=30
+    )
+
+    print(
+        "\n"
+        + "=" * 100
+    )
+
+    print(
+        "MEALORA FINAL "
+        "RECOMMENDATION RANKER"
+    )
+
+    print(
+        "=" * 100
+    )
+
+    print(
+        "\nTop Recommendations:\n"
+    )
+
+    print(
+        result.to_string(
+            index=False
+        )
+    )
+
+    print(
+        "\n"
+        + "=" * 100
+    )
+
+    print(
+        "RECOMMENDATION PIPELINE"
+    )
+
+    print(
+        "=" * 100
+    )
+
+    print(
+        "\n"
+        "1. TF-IDF + Cosine Similarity\n"
+        "2. Content-Based Recipe Similarity\n"
+        "3. Pantry Compatibility\n"
+        "4. Expiry / Food-Waste Score\n"
+        "5. Context Score\n"
+        "6. Multi-factor Candidate Filtering\n"
+        "7. Random Forest Final Reranking\n"
+        "8. HAN Graph Reranking\n"
+        "9. Nutrition Information Display (non-ranking)"
+    )
+
+    print(
+        "\n"
+        + "=" * 100
+    )

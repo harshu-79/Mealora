@@ -1,0 +1,2651 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import sys
+import os
+import re
+import json
+import joblib
+import urllib.request
+import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# Gemini is used only for multilingual recipe presentation.
+# The ML recommendation engine remains the source of recipe selection.
+
+sys.path.append(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "notebooks"
+))
+from final_ranker import recommend
+
+RECIPE_DATASET = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "datasets", "processed", "recipe_master_dataset.csv"
+)
+
+def _load_backend_env():
+    """Load simple KEY=VALUE pairs from backend/.env without exposing them to React."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key:
+                    os.environ.setdefault(key, value)
+    except Exception as e:
+        print("Backend .env load warning:", e)
+
+
+_load_backend_env()
+
+# Gemini 3.6 Flash is the current stable model.
+# Allow backend/.env to override it, but never fall back to the retired 2.5 model.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+
+app = Flask(__name__)
+CORS(app)
+
+FESTIVALS = {
+    # 2026 India major festivals / occasions.
+    # Dates verified against Timeanddate India 2026 and Drik Panchang.
+    "2026-01-01": "New Year's Day",
+    "2026-01-13": "Lohri",
+    "2026-01-14": "Makar Sankranti / Pongal",
+    "2026-01-23": "Vasant Panchami",
+    "2026-01-26": "Republic Day",
+    "2026-02-15": "Maha Shivaratri",
+    "2026-03-03": "Holika Dahan",
+    "2026-03-04": "Holi",
+    "2026-03-19": "Ugadi / Gudi Padwa / Chaitra Navratri",
+    "2026-03-21": "Eid / Ramzan Id",
+    "2026-03-26": "Rama Navami",
+    "2026-03-31": "Mahavir Jayanti",
+    "2026-04-03": "Good Friday",
+    "2026-04-14": "Vaisakhi / Ambedkar Jayanti",
+    "2026-04-15": "Bohag Bihu",
+    "2026-05-01": "Buddha Purnima",
+    "2026-05-28": "Bakrid / Eid al-Adha",
+    "2026-06-26": "Muharram / Ashura",
+    "2026-07-16": "Rath Yatra",
+    "2026-07-29": "Guru Purnima",
+    "2026-08-15": "Independence Day",
+    "2026-08-26": "Onam / Milad-un-Nabi",
+    "2026-08-28": "Raksha Bandhan",
+    "2026-09-04": "Krishna Janmashtami",
+    "2026-09-14": "Ganesh Chaturthi",
+    "2026-10-02": "Gandhi Jayanti",
+    "2026-10-11": "Sharad Navratri Begins",
+    "2026-10-17": "Durga Puja Begins",
+    "2026-10-19": "Durga Ashtami / Maha Navami",
+    "2026-10-20": "Dussehra / Vijayadashami",
+    "2026-10-29": "Karwa Chauth",
+    "2026-11-08": "Diwali / Deepavali / Naraka Chaturdashi",
+    "2026-11-09": "Govardhan Puja",
+    "2026-11-11": "Bhai Dooj",
+    "2026-11-15": "Chhath Puja",
+    "2026-11-24": "Guru Nanak Jayanti",
+    "2026-12-25": "Christmas",
+}
+
+def now_india():
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+def meal_from_time(value=None):
+    if value:
+        try:
+            hour = int(str(value).split(":")[0])
+        except Exception:
+            hour = now_india().hour
+    else:
+        hour = now_india().hour
+    if 5 <= hour < 11: return "Breakfast"
+    if 11 <= hour < 16: return "Lunch"
+    if 16 <= hour < 19: return "Snack"
+    return "Dinner"
+
+def festival_for_date(date_str=None):
+    d = date_str or now_india().strftime("%Y-%m-%d")
+    return {"name": FESTIVALS.get(d, ""), "date": d}
+
+def geocode_city(city):
+    if not city:
+        return None, None
+    try:
+        q = urllib.parse.urlencode({
+            "name": city, "count": 1, "language": "en",
+            "format": "json", "countryCode": "IN"
+        })
+        req = urllib.request.Request(
+            "https://geocoding-api.open-meteo.com/v1/search?" + q,
+            headers={"User-Agent": "Mealora/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode())
+        results = data.get("results") or []
+        if not results:
+            return None, None
+        return results[0].get("latitude"), results[0].get("longitude")
+    except Exception as e:
+        print("Geocoding failed:", e)
+        return None, None
+
+def reverse_geocode(lat, lon):
+    """Return a human-readable city/region for browser coordinates."""
+    if lat is None or lon is None:
+        return ""
+    try:
+        q = urllib.parse.urlencode({
+            "lat": float(lat),
+            "lon": float(lon),
+            "format": "json",
+            "zoom": 10,
+            "addressdetails": 1,
+        })
+        req = urllib.request.Request(
+            "https://nominatim.openstreetmap.org/reverse?" + q,
+            headers={"User-Agent": "Mealora/1.0 (educational project)"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode())
+        address = data.get("address", {})
+        return (
+            address.get("city")
+            or address.get("town")
+            or address.get("municipality")
+            or address.get("village")
+            or address.get("county")
+            or ""
+        )
+    except Exception as e:
+        print("Reverse geocoding failed:", e)
+        return ""
+
+def weather_for_coords(lat, lon):
+    if lat is None or lon is None:
+        return {"available": False, "condition": "Unknown", "temperature": None}
+    try:
+        q = urllib.parse.urlencode({
+            "latitude": float(lat), "longitude": float(lon),
+            "current": "temperature_2m,weather_code", "timezone": "auto"
+        })
+        req = urllib.request.Request(
+            "https://api.open-meteo.com/v1/forecast?" + q,
+            headers={"User-Agent": "Mealora/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            current = json.loads(r.read().decode()).get("current", {})
+        code = int(current.get("weather_code", -1))
+        if code in [51,53,55,56,57]: condition = "Drizzle"
+        elif code in [61,63,65,66,67,80,81,82]: condition = "Rain"
+        elif code in [95,96,99]: condition = "Thunderstorm"
+        elif code in [71,73,75,77,85,86]: condition = "Snow"
+        elif code == 0: condition = "Clear"
+        elif code in [1,2,3]: condition = "Cloudy"
+        else: condition = "Unknown"
+        return {
+            "available": True,
+            "condition": condition,
+            "temperature": current.get("temperature_2m"),
+            "weather_code": code
+        }
+    except Exception as e:
+        print("Weather failed:", e)
+        return {"available": False, "condition": "Unknown", "temperature": None}
+
+def cuisine_hint(lat, lon):
+    try:
+        lat, lon = float(lat), float(lon)
+        if 8 <= lat < 16 and 74 <= lon < 80: return "South Indian"
+        if 16 <= lat < 24 and 72 <= lon < 82: return "West Indian"
+        if 20 <= lat < 29 and 76 <= lon < 89: return "North Indian"
+        if 21 <= lat < 28 and 85 <= lon < 94: return "East Indian"
+    except Exception:
+        pass
+    return ""
+
+def build_context(data):
+    custom = str(data.get("mode", "")).lower() == "custom"
+
+    current = now_india()
+    date_value = data.get("date") if custom and data.get("date") else current.strftime("%Y-%m-%d")
+    time_value = data.get("time") if custom and data.get("time") else current.strftime("%H:%M")
+
+    # Location: custom city wins; otherwise browser coordinates.
+    city = (data.get("location_city") or data.get("location")) if custom else None
+    lat = data.get("latitude")
+    lon = data.get("longitude")
+
+    if city:
+        geo_lat, geo_lon = geocode_city(city)
+        if geo_lat is not None:
+            lat, lon = geo_lat, geo_lon
+    else:
+        city = reverse_geocode(lat, lon)
+
+    weather = weather_for_coords(lat, lon)
+    hint = cuisine_hint(lat, lon)
+
+    # Festival is resolved from the selected date in Custom mode
+    # and today's date in Automatic mode.
+    occasion = festival_for_date(date_value)
+
+    meal = data.get("meal_type")
+    if not meal or str(meal).lower() in ["auto", "automatic", "current"]:
+        meal = meal_from_time(time_value)
+
+    diet = data.get("diet") or "Vegetarian"
+    if str(diet).lower() in ["auto", "automatic"]:
+        diet = "Mixed"
+
+    cuisine = data.get("cuisine")
+    if not cuisine or str(cuisine).lower() in ["auto", "automatic"]:
+        cuisine = hint or "Indian"
+
+    return {
+        "date": date_value,
+        "time": time_value,
+        "day": datetime.strptime(date_value, "%Y-%m-%d").strftime("%A"),
+        "meal_type": meal,
+        "diet": diet,
+        "cuisine": cuisine,
+        "max_time": float(data.get("max_time", 30)),
+        "location_city": city or None,
+        "location_name": city or None,
+        "latitude": lat,
+        "longitude": lon,
+        "weather": weather,
+        "festival": occasion,
+        "mode": "custom" if custom else "automatic",
+        "festival_source": "Mealora 2026 festival calendar",
+    }
+
+
+# ============================================================
+# GEMINI RECIPE PRESENTATION LAYER
+# ============================================================
+# Gemini does NOT select recipes. The Mealora ML ranker selects
+# the recipe first; this endpoint only translates/presents it.
+# ============================================================
+
+LANGUAGE_NAMES = {
+    "English": "English",
+    "தமிழ்": "Tamil",
+    "తెలుగు": "Telugu",
+    "ಕನ್ನಡ": "Kannada",
+    "മലയാളം": "Malayalam",
+    "हिन्दी": "Hindi",
+    "मराठी": "Marathi",
+    "বাংলা": "Bengali",
+}
+
+def _recipe_column(df, candidates):
+    for name in candidates:
+        if name in df.columns:
+            return name
+    return None
+
+def _clean_recipe_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:
+        return ""
+    text = str(value).strip()
+
+    # Many recipe datasets store lists as JSON/Python-list strings.
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return "\n".join(str(x).strip() for x in parsed if str(x).strip())
+        except Exception:
+            pass
+
+    return text
+
+def _get_recipe_for_gemini(recipe_id=None, recipe_name=None):
+    if not os.path.exists(RECIPE_DATASET):
+        raise FileNotFoundError(
+            f"Recipe dataset not found: {RECIPE_DATASET}"
+        )
+
+    import pandas as pd
+
+    df = pd.read_csv(RECIPE_DATASET, low_memory=False)
+
+    id_col = _recipe_column(df, ["recipe_id", "id"])
+    name_col = _recipe_column(df, ["recipe_name", "name", "title"])
+    ingredients_col = _recipe_column(
+        df, ["ingredients", "ingredient_names", "ingredient_list"]
+    )
+    instructions_col = _recipe_column(
+        df, ["instructions", "directions", "steps", "method"]
+    )
+
+    row = None
+
+    if recipe_id is not None and id_col:
+        matches = df[df[id_col].astype(str) == str(recipe_id)]
+        if not matches.empty:
+            row = matches.iloc[0]
+
+    if row is None and recipe_name and name_col:
+        exact = df[
+            df[name_col].astype(str).str.strip().str.lower()
+            == str(recipe_name).strip().lower()
+        ]
+        if not exact.empty:
+            row = exact.iloc[0]
+
+    if row is None:
+        raise ValueError("Selected recipe was not found in the Mealora dataset.")
+
+    return {
+        "recipe_id": str(row[id_col]) if id_col else str(recipe_id or ""),
+        "recipe_name": _clean_recipe_value(row[name_col]) if name_col else str(recipe_name or ""),
+        "ingredients": _clean_recipe_value(row[ingredients_col]) if ingredients_col else "",
+        "instructions": _clean_recipe_value(row[instructions_col]) if instructions_col else "",
+    }
+
+
+# ============================================================
+# FESTIVAL SPECIAL RECIPE LAYER
+# ============================================================
+# This is a small Mealora-owned catalogue used only to highlight a
+# traditional dish on a festival day. It does NOT replace ML ranking.
+# The selected recipe is still looked up from Mealora's recipe dataset.
+
+FESTIVAL_SPECIALS = {
+    "Krishna Janmashtami": [
+        "Gopalkala", "Gopalkala Recipe", "Dahi Poha", "Aval Payasam",
+        "Panchamrit", "Panchamrut", "Seedai", "Sweet Aval"
+    ],
+    "Ganesh Chaturthi": [
+        "Modak", "Ukadiche Modak", "Kozhukattai", "Steamed Modak"
+    ],
+    "Diwali / Deepavali / Naraka Chaturdashi": [
+        "Mysore Pak", "Kaju Katli", "Gulab Jamun", "Badusha", "Adhirasam"
+    ],
+    "Makar Sankranti / Pongal": [
+        "Sakkarai Pongal", "Sweet Pongal", "Pongal", "Til Ladoo", "Sesame Ladoo"
+    ],
+    "Ugadi / Gudi Padwa / Chaitra Navratri": [
+        "Ugadi Pachadi", "Puran Poli", "Obbattu", "Holige"
+    ],
+    "Holi": [
+        "Gujiya", "Thandai", "Dahi Vada", "Malpua"
+    ],
+    "Onam / Milad-un-Nabi": [
+        "Avial", "Ada Pradhaman", "Payasam", "Onam Sadya"
+    ],
+    "Rath Yatra": [
+        "Mahaprasad", "Khichdi", "Dalma", "Poda Pitha"
+    ],
+    "Raksha Bandhan": [
+        "Besan Ladoo", "Kaju Katli", "Rasmalai", "Peda"
+    ],
+    "Navratri": [
+        "Sabudana Khichdi", "Kuttu Ki Roti", "Singhara Halwa", "Rajgira Ladoo"
+    ],
+    "Dussehra / Vijayadashami": [
+        "Payasam", "Puran Poli", "Mysore Pak", "Kheer"
+    ],
+    "Christmas": [
+        "Christmas Cake", "Plum Cake", "Fruit Cake", "Kulkul"
+    ],
+    "Eid / Ramzan Id": [
+        "Sheer Khurma", "Vermicelli Kheer", "Biryani", "Haleem"
+    ],
+}
+
+
+def _normalize_lookup_text(value):
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _split_recipe_lines(value):
+    """Turn dataset list/JSON/newline/semicolon recipe fields into a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+
+    # Most Mealora datasets use newline-separated values after cleaning.
+    lines = [x.strip(" •\t") for x in text.replace("\r", "\n").split("\n")]
+    lines = [x for x in lines if x]
+    if len(lines) > 1:
+        return lines
+
+    # Fall back to semicolon separation when a row stores a single-line list.
+    if ";" in text:
+        return [x.strip() for x in text.split(";") if x.strip()]
+    return [text]
+
+
+def _get_festival_special(festival_name):
+    """Find a festival-special recipe already present in Mealora's dataset."""
+    if not festival_name or not os.path.exists(RECIPE_DATASET):
+        return None
+
+    candidates = FESTIVAL_SPECIALS.get(festival_name, [])
+    if not candidates:
+        # Handles combined calendar labels such as 'Sharad Navratri Begins'.
+        if "Navratri" in festival_name:
+            candidates = FESTIVAL_SPECIALS.get("Navratri", [])
+        elif "Diwali" in festival_name or "Deepavali" in festival_name:
+            candidates = FESTIVAL_SPECIALS.get("Diwali / Deepavali / Naraka Chaturdashi", [])
+        elif "Eid" in festival_name:
+            candidates = FESTIVAL_SPECIALS.get("Eid / Ramzan Id", [])
+
+    if not candidates:
+        return None
+
+    import pandas as pd
+    df = pd.read_csv(RECIPE_DATASET, low_memory=False)
+    id_col = _recipe_column(df, ["recipe_id", "id"])
+    name_col = _recipe_column(df, ["recipe_name", "name", "title"])
+    ingredients_col = _recipe_column(df, ["ingredients", "ingredient_names", "ingredient_list"])
+    instructions_col = _recipe_column(df, ["instructions", "directions", "steps", "method"])
+
+    if not name_col:
+        return None
+
+    names = df[name_col].fillna("").astype(str)
+    normalized_names = names.map(_normalize_lookup_text)
+
+    # Prefer exact title matches, then safe whole-title substring matches.
+    for candidate in candidates:
+        target = _normalize_lookup_text(candidate)
+        if not target:
+            continue
+        exact_mask = normalized_names == target
+        matches = df[exact_mask]
+        if matches.empty:
+            contains_mask = normalized_names.str.contains(target, regex=False, na=False)
+            matches = df[contains_mask]
+        if matches.empty:
+            continue
+
+        row = matches.iloc[0]
+        return {
+            "recipe_id": str(row[id_col]) if id_col else "",
+            "recipe_name": _clean_recipe_value(row[name_col]),
+            "ingredients": _split_recipe_lines(_clean_recipe_value(row[ingredients_col]) if ingredients_col else ""),
+            "instructions": _split_recipe_lines(_clean_recipe_value(row[instructions_col]) if instructions_col else ""),
+            "festival": festival_name,
+            "special_reason": f"Traditional {festival_name} festival recipe",
+        }
+
+    return None
+
+def _gemini_translate_recipe(recipe, language):
+    """Translate ONLY the selected Mealora recipe into the requested language."""
+    language = language if language in LANGUAGE_NAMES else "English"
+    language_name = LANGUAGE_NAMES[language]
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured. Add it to backend/.env and restart Flask."
+        )
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise RuntimeError(
+            "Gemini SDK is not installed. Run: pip install google-genai"
+        )
+
+    client = genai.Client(api_key=api_key)
+
+    if language == "English":
+        language_rules = """
+- Keep the recipe in clear natural English.
+- Do not change the recipe facts, quantities, ingredients, or steps.
+"""
+    else:
+        language_rules = f"""
+- Translate EVERY user-visible word into {language_name} wherever a natural translation exists.
+- The recipe name MUST be in {language_name}.
+- EVERY ingredient line MUST be in {language_name}.
+- EVERY instruction MUST be a complete natural cooking sentence in {language_name}.
+- Do NOT produce English sentences with a few {language_name} words inserted.
+- Do NOT produce transliterated English sentences such as '3 tomatoes diced into large pieces'.
+- Do NOT leave English phrases such as 'diced into large pieces', 'as required', 'mix well',
+  'heat oil', etc. inside a {language_name} sentence.
+- Food names that are commonly used in India may be retained, but write them in the target
+  script where practical (for example, Telugu should use Telugu script rather than English).
+- For Telugu, Tamil, Kannada, Malayalam, Hindi, Marathi, and Bengali, write the response
+  using that language's native script. Do NOT write Telugu/Tamil/etc. as English transliteration.
+- Preserve quantities and units accurately. Translate the surrounding words naturally.
+- Make the instructions sound like a person explaining the recipe aloud in {language_name}.
+- Do NOT invent, remove, or reorder recipe facts.
+"""
+
+    prompt = f"""
+You are Mealora's multilingual recipe presentation layer.
+
+Mealora's own recommendation/ML engine has ALREADY selected this exact recipe.
+Your ONLY job is to present that exact recipe in {language_name}.
+You are NOT the recipe recommender and must NOT select another recipe.
+
+STRICT LANGUAGE REQUIREMENT:
+{language_rules}
+
+IMPORTANT OUTPUT REQUIREMENTS:
+1. Return JSON matching the schema exactly.
+2. 'language' must be exactly '{language}'.
+3. 'recipe_name', every item in 'ingredients', and every item in 'instructions'
+   must be written in the requested language.
+4. Do not mix English and the requested language in the same sentence unless a food
+   name genuinely has no useful translation. Even then, prefer the target script.
+5. Keep the meaning, quantities, and cooking sequence from the source exactly.
+6. Do not add nutrition values, health claims, substitutions, or new ingredients.
+7. The instructions should be natural spoken cooking language, suitable for Read Aloud.
+
+SOURCE RECIPE FROM MEALORA DATASET:
+Recipe ID: {recipe["recipe_id"]}
+Recipe Name: {recipe["recipe_name"]}
+
+Ingredients:
+{recipe["ingredients"]}
+
+Instructions:
+{recipe["instructions"]}
+"""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "recipe_name": {"type": "string"},
+            "language": {"type": "string"},
+            "ingredients": {"type": "array", "items": {"type": "string"}},
+            "instructions": {"type": "array", "items": {"type": "string"}},
+            "note": {"type": "string"},
+        },
+        "required": ["recipe_name", "language", "ingredients", "instructions", "note"],
+    }
+
+    # Gemini 3.6 Flash no longer accepts the old temperature/top_p/top_k parameters.
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+        ),
+    )
+
+    text = response.text
+    if not text:
+        raise RuntimeError("Gemini returned an empty response.")
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Gemini returned invalid structured output: {e}")
+
+    # Never trust a model response to silently change the requested language.
+    returned_language = str(result.get("language", "")).strip()
+    if returned_language != language:
+        raise RuntimeError(
+            f"Gemini returned language '{returned_language}' instead of requested '{language}'."
+        )
+
+    for key in ("recipe_name", "ingredients", "instructions"):
+        if key not in result:
+            raise RuntimeError(f"Gemini response is missing '{key}'.")
+
+    if not isinstance(result["ingredients"], list) or not isinstance(result["instructions"], list):
+        raise RuntimeError("Gemini returned an invalid ingredient/instruction structure.")
+
+    result["recipe_id"] = recipe["recipe_id"]
+    result["source"] = "Mealora recipe dataset + Gemini presentation"
+    return result
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "success",
+        "message": "Mealora ML Recommendation API is running",
+        "current_time": now_india().isoformat(),
+        "current_meal_type": meal_from_time(),
+        "festival": festival_for_date()
+    })
+
+@app.route("/api/context", methods=["POST"])
+def context():
+    try:
+        return jsonify({"success": True, "context": build_context(request.get_json() or {})})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+
+
+
+
+# ===== MEALORA WEEKLY PLANNER V3 START =====
+@app.route("/api/weekly-plan", methods=["POST"])
+def weekly_plan_v3():
+    """
+    Pantry-first weekly planner.
+
+    Key correction:
+    - Do NOT ask the generic recommender for 35 recipes and then try to
+      optimize them. That caused pantry_score=0 and irrelevant recipes.
+    - Score the full recipe master dataset against the CURRENT pantry first.
+    - Use pantry coverage as a strong gate/objective.
+    - Keep ML/context as ranking signals, not as permission to ignore the pantry.
+    - Build meal/side roles from pantry-compatible candidates.
+    """
+    try:
+        import ast
+        import random
+        import re as _re
+        from difflib import SequenceMatcher
+        import numpy as np
+        import pandas as pd
+
+        data = request.get_json() or {}
+        pantry = data.get("pantry") or []
+        household = data.get("household") or {}
+
+        adults = max(int(household.get("adults", 0) or 0), 0)
+        children = max(int(household.get("children", 0) or 0), 0)
+        seniors = max(int(household.get("seniors", 0) or 0), 0)
+
+        if adults + children + seniors <= 0:
+            return jsonify({
+                "success": False,
+                "error": "Add at least one household member."
+            }), 400
+
+        mode = str(data.get("mode", "automatic") or "automatic").lower()
+        diet = str(data.get("diet", "Mixed") or "Mixed")
+        cuisine = str(data.get("cuisine", "Auto") or "Auto")
+        max_time = float(data.get("max_time", 60) or 60)
+        include_snacks = bool(data.get("include_snacks", True))
+        special_day = str(data.get("special_day", "Saturday") or "None")
+
+        ctx = build_context({
+            "mode": mode,
+            "date": data.get("date"),
+            "time": data.get("time"),
+            "location_city": data.get("location_city"),
+            "location": data.get("location_city"),
+            "latitude": data.get("latitude"),
+            "longitude": data.get("longitude"),
+            "meal_type": data.get("meal_type", "Automatic"),
+            "diet": diet,
+            "cuisine": cuisine,
+            "max_time": max_time,
+        })
+
+        if diet.lower() in ("auto", "automatic"):
+            diet = ctx.get("diet", diet)
+        if cuisine.lower() in ("auto", "automatic"):
+            cuisine = ctx.get("cuisine", cuisine)
+
+        def norm_text(value):
+            s = str(value or "").lower()
+            s = s.replace("&", " and ")
+            s = s.replace("chilli", "chili")
+            s = s.replace("capsicum", "bell pepper")
+            s = s.replace("coriander leaves", "cilantro")
+            s = s.replace("coriander leaf", "cilantro")
+            s = s.replace("curd", "yogurt")
+            s = s.replace("dahi", "yogurt")
+            s = _re.sub(r"[^a-z0-9\s]", " ", s)
+            s = _re.sub(r"\s+", " ", s).strip()
+            return s
+
+        def token_set(value):
+            return {
+                x for x in norm_text(value).split()
+                if len(x) >= 3 and x not in {
+                    "the", "and", "with", "for", "from", "into",
+                    "cup", "cups", "tsp", "tbsp", "tablespoon",
+                    "tablespoons", "teaspoon", "teaspoons"
+                }
+            }
+
+        UNIT_RE = (
+            r"(?:kg|kgs|kilo|kilos|kilogram|kilograms|g|gram|grams|"
+            r"ml|milliliter|milliliters|litre|litres|liter|liters|"
+            r"l|piece|pieces|pcs|clove|cloves|bunch|bunches|"
+            r"slice|slices|tbsp|tsp|cup|cups|pinch|handful)"
+        )
+
+        def clean_ingredient_name(value):
+            s = str(value or "").strip()
+            if not s:
+                return ""
+
+            # Remove leading quantity/unit.
+            s = _re.sub(
+                rf"^\s*\d+(?:\.\d+)?\s*(?:{UNIT_RE})?\s*(?:of\s+)?",
+                "",
+                s,
+                flags=_re.I,
+            )
+
+            # Remove common parenthetical notes.
+            s = _re.sub(r"\([^)]*\)", " ", s)
+
+            # Remove preparation tails that should not become ingredient names.
+            s = _re.sub(
+                r"\b(chopped|sliced|diced|minced|grated|crushed|"
+                r"finely|roughly|freshly|to taste|as needed)\b",
+                " ",
+                s,
+                flags=_re.I,
+            )
+
+            s = _re.sub(r"\s+", " ", s).strip(" ,.-")
+            return s
+
+        def parse_ingredients(value):
+            if isinstance(value, list):
+                return [
+                    clean_ingredient_name(x)
+                    for x in value
+                    if clean_ingredient_name(x)
+                ]
+
+            if value is None:
+                return []
+
+            s = str(value).strip()
+            if not s or s.lower() in ("nan", "none", "null"):
+                return []
+
+            # Python/JSON list stored as text.
+            if s.startswith("[") and s.endswith("]"):
+                for parser in (json.loads, ast.literal_eval):
+                    try:
+                        parsed = parser(s)
+                        if isinstance(parsed, list):
+                            return [
+                                clean_ingredient_name(x)
+                                for x in parsed
+                                if clean_ingredient_name(x)
+                            ]
+                    except Exception:
+                        pass
+
+            # Newline / semicolon / pipe separated datasets.
+            parts = re.split(r"\n|;|\|", s)
+            if len(parts) == 1:
+                # Some datasets use comma-separated ingredient lists.
+                parts = [x.strip() for x in s.split(",")]
+
+            return [
+                clean_ingredient_name(x)
+                for x in parts
+                if clean_ingredient_name(x)
+            ]
+
+        def first_col(df, candidates):
+            lower = {str(c).lower(): c for c in df.columns}
+            for c in candidates:
+                if str(c).lower() in lower:
+                    return lower[str(c).lower()]
+            return None
+
+        # ------------------------------------------------------------
+        # Current pantry -> normalized pantry names.
+        # ------------------------------------------------------------
+        pantry_names = []
+        pantry_expiry_names = []
+
+        today = now_india().date()
+
+        for item in pantry:
+            name = (
+                item.get("normalized_name")
+                or item.get("ingredient_name")
+                or item.get("name")
+            )
+            if not name:
+                continue
+
+            cleaned = clean_ingredient_name(name)
+            if cleaned:
+                pantry_names.append(cleaned)
+
+            expiry = item.get("expiry_date")
+            if expiry:
+                try:
+                    days = (
+                        datetime.strptime(
+                            str(expiry)[:10], "%Y-%m-%d"
+                        ).date() - today
+                    ).days
+                    if days <= 7:
+                        pantry_expiry_names.append(cleaned)
+                except Exception:
+                    pass
+
+        # De-duplicate pantry aliases.
+        pantry_names = list(dict.fromkeys(pantry_names))
+        pantry_expiry_names = list(dict.fromkeys(pantry_expiry_names))
+
+        if not pantry_names:
+            return jsonify({
+                "success": False,
+                "error": "Your pantry is empty. Add ingredients before generating the weekly plan."
+            }), 400
+
+        # Staple ingredients should help a recipe, but should not make a
+        # recipe look pantry-complete by themselves.
+        STAPLES = {
+            "salt", "sugar", "water", "oil", "cooking oil",
+            "sunflower oil", "groundnut oil", "coconut oil",
+            "mustard oil", "sesame oil", "olive oil", "ghee",
+            "butter", "black pepper", "turmeric", "turmeric powder",
+            "red chili", "red chili powder", "coriander powder",
+            "cumin powder", "garam masala", "hing", "asafoetida",
+            "ginger garlic paste"
+        }
+
+        def ingredient_match(recipe_ing, pantry_name):
+            a = norm_text(recipe_ing)
+            b = norm_text(pantry_name)
+
+            if not a or not b:
+                return False
+
+            if a == b or a in b or b in a:
+                return True
+
+            at = token_set(a)
+            bt = token_set(b)
+
+            if not at or not bt:
+                return False
+
+            # Strong token overlap.
+            overlap = len(at & bt) / max(len(at), len(bt))
+            if overlap >= 0.70:
+                return True
+
+            # Singular/plural and common-word similarity.
+            for x in at:
+                for y in bt:
+                    if len(x) >= 5 and len(y) >= 5:
+                        if SequenceMatcher(None, x, y).ratio() >= 0.88:
+                            return True
+
+            return False
+
+        def score_recipe(recipe_ingredients):
+            ingredients = [
+                x for x in recipe_ingredients
+                if norm_text(x)
+            ]
+
+            if not ingredients:
+                return {
+                    "pantry": 0.0,
+                    "core_pantry": 0.0,
+                    "expiry": 0.0,
+                    "matched": [],
+                    "missing": [],
+                    "missing_core": [],
+                }
+
+            matched = []
+            missing = []
+            missing_core = []
+            matched_expiry = []
+
+            core_ingredients = []
+
+            for ing in ingredients:
+                is_staple = norm_text(ing) in {
+                    norm_text(x) for x in STAPLES
+                }
+
+                if not is_staple:
+                    core_ingredients.append(ing)
+
+                match = next(
+                    (
+                        p for p in pantry_names
+                        if ingredient_match(ing, p)
+                    ),
+                    None,
+                )
+
+                if match:
+                    matched.append(match)
+
+                    if any(
+                        ingredient_match(ing, e)
+                        for e in pantry_expiry_names
+                    ):
+                        matched_expiry.append(match)
+                else:
+                    missing.append(ing)
+                    if not is_staple:
+                        missing_core.append(ing)
+
+            all_coverage = len(matched) / max(len(ingredients), 1)
+
+            if core_ingredients:
+                core_matched = len(core_ingredients) - len(missing_core)
+                core_coverage = core_matched / len(core_ingredients)
+            else:
+                core_coverage = all_coverage
+
+            expiry_coverage = (
+                len(set(matched_expiry))
+                / max(len(set(pantry_expiry_names)), 1)
+                if pantry_expiry_names
+                else 0.0
+            )
+
+            # Pantry coverage is about recipe requirements, NOT
+            # recipe-match-count / 139 pantry rows.
+            pantry_score = (
+                0.75 * core_coverage +
+                0.25 * all_coverage
+            )
+
+            return {
+                "pantry": float(np.clip(pantry_score, 0, 1)),
+                "core_pantry": float(np.clip(core_coverage, 0, 1)),
+                "expiry": float(np.clip(expiry_coverage, 0, 1)),
+                "matched": list(dict.fromkeys(matched)),
+                "missing": missing,
+                "missing_core": missing_core,
+            }
+
+        # ------------------------------------------------------------
+        # Load the COMPLETE recipe master dataset.
+        # ------------------------------------------------------------
+        df = pd.read_csv(RECIPE_DATASET)
+
+        if df.empty:
+            raise RuntimeError("The recipe master dataset is empty.")
+
+        name_col = first_col(
+            df,
+            ["recipe_name", "name", "title", "recipe", "dish_name"]
+        )
+        id_col = first_col(
+            df,
+            ["recipe_id", "id", "ID", "recipeid"]
+        )
+        ingredient_col = first_col(
+            df,
+            [
+                "ingredients", "ingredient_names",
+                "cleaned_ingredients", "Cleaned-Ingredients",
+                "TranslatedIngredients", "ingredient_list",
+                "Ingredients"
+            ]
+        )
+        meal_col = first_col(
+            df,
+            ["meal_type", "meal", "mealtype", "meal_type_name"]
+        )
+        cuisine_col = first_col(
+            df,
+            ["cuisine", "cuisine_type"]
+        )
+        diet_col = first_col(
+            df,
+            ["diet", "diet_type", "diet_category"]
+        )
+        time_col = first_col(
+            df,
+            [
+                "cooking_time_minutes", "cooking_time",
+                "cook_time", "prep_time_minutes",
+                "total_time_minutes", "total_time"
+            ]
+        )
+
+        if name_col is None or ingredient_col is None:
+            raise RuntimeError(
+                "Mealora could not identify recipe_name/ingredients columns "
+                f"in {RECIPE_DATASET}."
+            )
+
+        # Deduplicate recipes.
+        df = df.copy()
+        df["_mealora_recipe_name"] = (
+            df[name_col].fillna("Mealora Recipe").astype(str).str.strip()
+        )
+        df["_mealora_ingredients"] = df[ingredient_col].apply(parse_ingredients)
+
+        if id_col:
+            df["_mealora_recipe_id"] = df[id_col].astype(str)
+        else:
+            df["_mealora_recipe_id"] = [
+                str(i) for i in range(len(df))
+            ]
+
+        # Remove unusable rows.
+        df = df[
+            (df["_mealora_recipe_name"] != "") &
+            (df["_mealora_ingredients"].map(len) > 0)
+        ].copy()
+
+        # ------------------------------------------------------------
+        # Context / ML columns if they already exist in the master.
+        # Otherwise use conservative neutral defaults.
+        # ------------------------------------------------------------
+        def row_score(row, candidates, default=0.5):
+            for c in candidates:
+                if c in row.index:
+                    try:
+                        value = float(row[c])
+                        if np.isfinite(value):
+                            return float(np.clip(value, 0, 1))
+                    except Exception:
+                        pass
+            return default
+
+        def classify_meal(row, recipe_name, ingredients):
+            raw = str(row.get(meal_col, "") if meal_col else "").lower()
+            text = f"{recipe_name} {' '.join(ingredients)}".lower()
+
+            if any(x in raw for x in ["breakfast", "morning"]):
+                return "Breakfast"
+            if any(x in raw for x in ["snack", "starter", "appetizer"]):
+                return "Snack"
+            if any(x in raw for x in ["dinner", "supper"]):
+                return "Dinner"
+            if "lunch" in raw:
+                return "Lunch"
+
+            # Name-based fallback.
+            if any(x in text for x in [
+                "dosa", "idli", "upma", "poha", "pongal",
+                "paratha", "pancake", "omelette", "omelet",
+                "puri", "vada", "uttapam", "toast"
+            ]):
+                return "Breakfast"
+
+            if any(x in text for x in [
+                "tea", "coffee", "pakora", "bajji", "bonda",
+                "samosa", "sandwich", "cutlet", "snack"
+            ]):
+                return "Snack"
+
+            return "Main"
+
+        # Score every recipe against the actual pantry.
+        scored = []
+
+        for _, row in df.iterrows():
+            ingredients = row["_mealora_ingredients"]
+            p = score_recipe(ingredients)
+
+            # Strongly discourage recipes that need many missing core items.
+            core = p["core_pantry"]
+
+            ml = max(
+                row_score(
+                    row,
+                    ["hgb_suitability_score", "rf_suitability_score",
+                     "ml_suitability_score"],
+                    0.5
+                ),
+                row_score(row, ["han_score"], 0.5)
+            )
+
+            context_score = row_score(
+                row,
+                ["context_score", "context_match_score"],
+                0.5
+            )
+
+            nutrition_score = row_score(
+                row,
+                ["nutrition_score", "nutrition_match_score"],
+                0.5
+            )
+
+            time_score = 1.0
+
+            if time_col:
+                try:
+                    t = float(row[time_col])
+                    if np.isfinite(t):
+                        time_score = float(
+                            np.clip(
+                                1.0 - max(t - max_time, 0) / max(max_time, 1),
+                                0,
+                                1
+                            )
+                        )
+                except Exception:
+                    pass
+
+            scored.append({
+                "recipe_id": str(row["_mealora_recipe_id"]),
+                "recipe_name": str(row["_mealora_recipe_name"]),
+                "ingredients": ingredients,
+                "pantry": p["pantry"],
+                "core_pantry": core,
+                "expiry": p["expiry"],
+                "matched_pantry": p["matched"],
+                "missing": p["missing"],
+                "missing_core": p["missing_core"],
+                "ml": ml,
+                "context": context_score,
+                "nutrition": nutrition_score,
+                "time": time_score,
+                "meal_role": classify_meal(
+                    row,
+                    str(row["_mealora_recipe_name"]),
+                    ingredients
+                ),
+                "cuisine": str(row[cuisine_col]) if cuisine_col else "",
+                "diet": str(row[diet_col]) if diet_col else "",
+                "cook_time": (
+                    float(row[time_col])
+                    if time_col
+                    and str(row[time_col]).strip()
+                    and str(row[time_col]).lower() != "nan"
+                    else None
+                ),
+            })
+
+        recipes = pd.DataFrame(scored)
+
+        # ------------------------------------------------------------
+        # User filters.
+        # ------------------------------------------------------------
+        def matches_filter(row):
+            if diet and diet.lower() not in ("mixed", "any", "auto", "automatic", "none"):
+                raw = str(row["diet"]).lower()
+                if raw and diet.lower() not in raw:
+                    return False
+
+            if cuisine and cuisine.lower() not in ("auto", "automatic", "any", "mixed", "none"):
+                raw = str(row["cuisine"]).lower()
+                if raw and cuisine.lower() not in raw:
+                    return False
+
+            return True
+
+        recipes = recipes[recipes.apply(matches_filter, axis=1)].copy()
+
+        # Pantry-first candidate gate.
+        # Main meals should normally use at least ~55% of their
+        # non-staple ingredients from the current pantry.
+        pantry_candidates = recipes[
+            recipes["core_pantry"] >= 0.55
+        ].copy()
+
+        # If the dataset/filter combination is restrictive, relax gradually.
+        if len(pantry_candidates) < 100:
+            pantry_candidates = recipes[
+                recipes["core_pantry"] >= 0.40
+            ].copy()
+
+        if len(pantry_candidates) < 50:
+            pantry_candidates = recipes[
+                recipes["pantry"] >= 0.35
+            ].copy()
+
+        if len(pantry_candidates) == 0:
+            pantry_candidates = recipes.sort_values(
+                ["core_pantry", "pantry", "ml"],
+                ascending=False
+            ).head(100).copy()
+
+        # Ranking deliberately gives pantry more influence than generic ML.
+        pantry_candidates["_base_score"] = (
+            0.42 * pantry_candidates["core_pantry"] +
+            0.16 * pantry_candidates["pantry"] +
+            0.12 * pantry_candidates["expiry"] +
+            0.10 * pantry_candidates["ml"] +
+            0.08 * pantry_candidates["context"] +
+            0.07 * pantry_candidates["nutrition"] +
+            0.05 * pantry_candidates["time"]
+        )
+
+        # ------------------------------------------------------------
+        # Meal-role pools.
+        # ------------------------------------------------------------
+        def is_breakfast(row):
+            return row["meal_role"] == "Breakfast"
+
+        def is_snack(row):
+            return row["meal_role"] == "Snack"
+
+        def is_main(row):
+            return row["meal_role"] in ("Lunch", "Dinner", "Main")
+
+        breakfast_pool = pantry_candidates[
+            pantry_candidates.apply(is_breakfast, axis=1)
+        ].copy()
+
+        main_pool = pantry_candidates[
+            pantry_candidates.apply(is_main, axis=1)
+        ].copy()
+
+        snack_pool = pantry_candidates[
+            pantry_candidates.apply(is_snack, axis=1)
+        ].copy()
+
+        if breakfast_pool.empty:
+            breakfast_pool = pantry_candidates.copy()
+
+        if main_pool.empty:
+            main_pool = pantry_candidates.copy()
+
+        if snack_pool.empty:
+            snack_pool = breakfast_pool.copy()
+
+        # Side dishes: prefer vegetable/dal/poriyal/kootu/raita/salad
+        # rather than letting any main recipe become a "side".
+        SIDE_TERMS = (
+            "poriyal", "sabzi", "subzi", "kootu", "thoran",
+            "dal", "sambar", "rasam", "raita", "salad",
+            "chutney", "kurma", "vegetable", "stir fry",
+            "palya", "avial", "bhaji"
+        )
+
+        side_pool = main_pool[
+            main_pool["recipe_name"].str.lower().apply(
+                lambda x: any(t in x for t in SIDE_TERMS)
+            )
+        ].copy()
+
+        if side_pool.empty:
+            side_pool = main_pool.copy()
+
+        # Weekend special recipes: biryani/pulao/etc., but ONLY if pantry-compatible.
+        TREAT_TERMS = (
+            "biryani", "biriyani", "pulao", "fried rice",
+            "korma", "tikka", "butter masala", "special"
+        )
+
+        special_pool = main_pool[
+            main_pool["recipe_name"].str.lower().apply(
+                lambda x: any(t in x for t in TREAT_TERMS)
+            )
+        ].copy()
+
+        if special_pool.empty:
+            special_pool = main_pool.copy()
+
+        # ------------------------------------------------------------
+        # Build 35 slots. NSGA-II optimizes the selected candidate
+        # combination, but candidates are already pantry-grounded.
+        # ------------------------------------------------------------
+        days = [
+            "Monday", "Tuesday", "Wednesday",
+            "Thursday", "Friday", "Saturday", "Sunday"
+        ]
+
+        slots = []
+        domains = []
+
+        def top_domain(pool, n=30):
+            if pool.empty:
+                return []
+            return list(
+                pool.sort_values(
+                    ["_base_score", "core_pantry", "expiry"],
+                    ascending=False
+                ).head(n).index
+            )
+
+        for day in days:
+            # Breakfast
+            slots.append((day, "breakfast"))
+            domains.append(top_domain(breakfast_pool, 35))
+
+            # Lunch main
+            slots.append((day, "lunch_main"))
+            domains.append(top_domain(main_pool, 45))
+
+            # Lunch side
+            slots.append((day, "lunch_side"))
+            domains.append(top_domain(side_pool, 35))
+
+            # Dinner main — special/treat on selected weekend day.
+            slots.append((day, "dinner_main"))
+            if day == special_day and special_day != "None":
+                domains.append(top_domain(special_pool, 45))
+            else:
+                domains.append(top_domain(main_pool, 45))
+
+            # Dinner side
+            slots.append((day, "dinner_side"))
+            domains.append(top_domain(side_pool, 35))
+
+        # Remove empty domains.
+        if any(not d for d in domains):
+            raise RuntimeError(
+                "Mealora could not build pantry-compatible candidate pools."
+            )
+
+        # Master candidate table. Keep recipe IDs as the stable key so
+        # breakfast/main/side pools can share the same candidate records.
+        candidates = pd.concat(
+            [
+                breakfast_pool,
+                main_pool,
+                side_pool,
+                special_pool
+            ],
+            ignore_index=True
+        ).drop_duplicates("recipe_id").reset_index(drop=True)
+
+        id_to_pos = {
+            str(row["recipe_id"]): i
+            for i, (_, row) in enumerate(candidates.iterrows())
+        }
+
+        # Rebuild every slot domain by recipe_id. This avoids dataframe-index
+        # collisions between the source pools.
+        domain_ids = []
+
+        for day, slot_name in slots:
+            if slot_name == "breakfast":
+                source_pool = breakfast_pool
+            elif slot_name in ("lunch_side", "dinner_side"):
+                source_pool = side_pool
+            elif (
+                slot_name == "dinner_main"
+                and day == special_day
+                and special_day != "None"
+            ):
+                source_pool = special_pool
+            else:
+                source_pool = main_pool
+
+            source_pool = source_pool.sort_values(
+                ["_base_score", "core_pantry", "expiry"],
+                ascending=False
+            ).head(45)
+
+            ids = [
+                id_to_pos[str(recipe_id)]
+                for recipe_id in source_pool["recipe_id"].tolist()
+                if str(recipe_id) in id_to_pos
+            ]
+
+            domain_ids.append(list(dict.fromkeys(ids)))
+
+        domains = domain_ids
+
+        # ------------------------------------------------------------
+        # NSGA-II objective.
+        # ------------------------------------------------------------
+        def fitness(chromosome):
+            rows = [candidates.iloc[i].to_dict() for i in chromosome]
+
+            pantry_score = np.mean([r["core_pantry"] for r in rows])
+            expiry_score = np.mean([r["expiry"] for r in rows])
+            ml_score = np.mean([r["ml"] for r in rows])
+            nutrition_score = np.mean([r["nutrition"] for r in rows])
+            context_score = np.mean([r["context"] for r in rows])
+            time_score = np.mean([r["time"] for r in rows])
+
+            recipe_names = [
+                str(r["recipe_name"]).strip().lower()
+                for r in rows
+            ]
+            unique = len(set(recipe_names)) / max(len(recipe_names), 1)
+
+            ingredient_sets = [
+                set(token_set(" ".join(r["ingredients"])))
+                for r in rows
+            ]
+
+            # Ingredient reuse is useful, but not so strong that every day
+            # becomes the same meal.
+            reuse_pairs = []
+            for i in range(1, len(ingredient_sets)):
+                if ingredient_sets[i] and ingredient_sets[i - 1]:
+                    reuse_pairs.append(
+                        len(
+                            ingredient_sets[i] &
+                            ingredient_sets[i - 1]
+                        ) /
+                        max(
+                            len(
+                                ingredient_sets[i] |
+                                ingredient_sets[i - 1]
+                            ),
+                            1
+                        )
+                    )
+
+            reuse = np.mean(reuse_pairs) if reuse_pairs else 0.5
+
+            purchase = np.mean([
+                1.0 - min(
+                    len(r["missing_core"]) /
+                    max(len(r["ingredients"]), 1),
+                    1.0
+                )
+                for r in rows
+            ])
+
+            # Pantry is intentionally first and strongest.
+            return np.array([
+                pantry_score,
+                expiry_score,
+                ml_score,
+                nutrition_score,
+                context_score,
+                time_score,
+                purchase,
+                reuse,
+                unique
+            ], dtype=float)
+
+        def dominates(a, b):
+            return np.all(a >= b) and np.any(a > b)
+
+        def fast_fronts(values):
+            n = len(values)
+            domination_count = [0] * n
+            dominated = [[] for _ in range(n)]
+            fronts = [[]]
+
+            for p in range(n):
+                for q in range(n):
+                    if p == q:
+                        continue
+                    if dominates(values[p], values[q]):
+                        dominated[p].append(q)
+                    elif dominates(values[q], values[p]):
+                        domination_count[p] += 1
+
+                if domination_count[p] == 0:
+                    fronts[0].append(p)
+
+            i = 0
+            while i < len(fronts) and fronts[i]:
+                next_front = []
+                for p in fronts[i]:
+                    for q in dominated[p]:
+                        domination_count[q] -= 1
+                        if domination_count[q] == 0:
+                            next_front.append(q)
+                if next_front:
+                    fronts.append(next_front)
+                i += 1
+
+            return fronts
+
+        def crowding(front, values):
+            distance = {i: 0.0 for i in front}
+
+            if len(front) <= 2:
+                for i in front:
+                    distance[i] = float("inf")
+                return distance
+
+            for obj in range(values.shape[1]):
+                ordered = sorted(
+                    front,
+                    key=lambda i: values[i, obj]
+                )
+
+                distance[ordered[0]] = float("inf")
+                distance[ordered[-1]] = float("inf")
+
+                low = values[ordered[0], obj]
+                high = values[ordered[-1], obj]
+
+                if high == low:
+                    continue
+
+                for k in range(1, len(ordered) - 1):
+                    distance[ordered[k]] += (
+                        values[ordered[k + 1], obj] -
+                        values[ordered[k - 1], obj]
+                    ) / (high - low)
+
+            return distance
+
+        def mutate(chromosome):
+            out = chromosome[:]
+            for i in range(len(out)):
+                if random.random() < 0.15:
+                    out[i] = random.choice(domains[i])
+            return out
+
+        random.seed(42)
+        np.random.seed(42)
+
+        pop_size = 50
+        generations = 30
+
+        population = [
+            [random.choice(domain) for domain in domains]
+            for _ in range(pop_size)
+        ]
+
+        best_front = None
+        best_values = None
+
+        for _ in range(generations):
+            values = np.array([
+                fitness(chromosome)
+                for chromosome in population
+            ])
+
+            fronts = fast_fronts(values)
+
+            if fronts and fronts[0]:
+                best_front = [
+                    population[i][:]
+                    for i in fronts[0]
+                ]
+                best_values = values[fronts[0]]
+
+            ranks = np.zeros(len(population), dtype=int)
+            crowd = np.zeros(len(population), dtype=float)
+
+            for rank, front in enumerate(fronts):
+                for i in front:
+                    ranks[i] = rank
+
+                cd = crowding(front, values)
+                for i, score in cd.items():
+                    crowd[i] = score
+
+            offspring = []
+
+            while len(offspring) < pop_size:
+                def pick():
+                    a = random.randrange(pop_size)
+                    b = random.randrange(pop_size)
+
+                    if (
+                        ranks[a] < ranks[b] or
+                        (
+                            ranks[a] == ranks[b] and
+                            crowd[a] > crowd[b]
+                        )
+                    ):
+                        return population[a][:]
+
+                    return population[b][:]
+
+                parent_a = pick()
+                parent_b = pick()
+
+                cut = random.randint(1, len(parent_a) - 1)
+
+                child_a = mutate(
+                    parent_a[:cut] + parent_b[cut:]
+                )
+                child_b = mutate(
+                    parent_b[:cut] + parent_a[cut:]
+                )
+
+                offspring.extend([child_a, child_b])
+
+            combined = population + offspring[:pop_size]
+
+            combined_values = np.array([
+                fitness(chromosome)
+                for chromosome in combined
+            ])
+
+            fronts = fast_fronts(combined_values)
+
+            new_population = []
+
+            for front in fronts:
+                if len(new_population) + len(front) <= pop_size:
+                    new_population.extend(
+                        combined[i] for i in front
+                    )
+                else:
+                    cd = crowding(front, combined_values)
+                    ordered = sorted(
+                        front,
+                        key=lambda i: cd[i],
+                        reverse=True
+                    )
+                    new_population.extend(
+                        combined[i]
+                        for i in ordered[
+                            :pop_size - len(new_population)
+                        ]
+                    )
+                    break
+
+            population = new_population
+
+        if not best_front:
+            raise RuntimeError(
+                "NSGA-II did not produce a weekly plan."
+            )
+
+        # Pantry-first final selection.
+        weights = np.array([
+            0.30,  # pantry
+            0.15,  # expiry
+            0.13,  # ML suitability
+            0.10,  # nutrition
+            0.08,  # context
+            0.07,  # time
+            0.07,  # purchase
+            0.05,  # ingredient reuse
+            0.05   # uniqueness
+        ])
+
+        selected = best_front[
+            int(
+                np.argmax([
+                    np.dot(
+                        np.clip(v, 0, 1),
+                        weights
+                    )
+                    for v in best_values
+                ])
+            )
+        ]
+
+        def serialize(index, is_treat=False):
+            row = candidates.iloc[int(index)]
+
+            return {
+                "recipe_id": str(row["recipe_id"]),
+                "recipe_name": str(row["recipe_name"]),
+                "suitability_score": round(
+                    float(row["ml"]), 4
+                ),
+                "pantry_score": round(
+                    float(row["core_pantry"]), 4
+                ),
+                "expiry_score": round(
+                    float(row["expiry"]), 4
+                ),
+                "context_score": round(
+                    float(row["context"]), 4
+                ),
+                "nutrition_score": round(
+                    float(row["nutrition"]), 4
+                ),
+                "purchase_score": round(
+                    1.0 - min(
+                        len(row["missing_core"]) /
+                        max(len(row["ingredients"]), 1),
+                        1.0
+                    ),
+                    4
+                ),
+                "matched_pantry": list(
+                    row["matched_pantry"]
+                )[:15],
+                "missing_ingredients": list(
+                    row["missing"]
+                )[:10],
+                "ingredients": list(
+                    row["ingredients"]
+                ),
+                "is_treat": bool(is_treat)
+            }
+
+        plan = []
+
+        # Selected chromosome has 35 positions:
+        # day * [breakfast, lunch main, lunch side, dinner main, dinner side]
+        for day_index, day in enumerate(days):
+            base = day_index * 5
+            special = (
+                special_day != "None"
+                and day == special_day
+            )
+
+            breakfast_i = selected[base]
+            lunch_i = selected[base + 1]
+            lunch_side_i = selected[base + 2]
+            dinner_i = selected[base + 3]
+            dinner_side_i = selected[base + 4]
+
+            # Prevent the same recipe from being its own side.
+            if (
+                candidates.iloc[lunch_side_i]["recipe_id"] ==
+                candidates.iloc[lunch_i]["recipe_id"]
+            ):
+                alternatives = domain_ids[base + 2]
+                alternatives = [
+                    x for x in alternatives
+                    if candidates.iloc[x]["recipe_id"] !=
+                    candidates.iloc[lunch_i]["recipe_id"]
+                ]
+                if alternatives:
+                    lunch_side_i = max(
+                        alternatives,
+                        key=lambda x:
+                        candidates.iloc[x]["core_pantry"]
+                    )
+
+            if (
+                candidates.iloc[dinner_side_i]["recipe_id"] ==
+                candidates.iloc[dinner_i]["recipe_id"]
+            ):
+                alternatives = domain_ids[base + 4]
+                alternatives = [
+                    x for x in alternatives
+                    if candidates.iloc[x]["recipe_id"] !=
+                    candidates.iloc[dinner_i]["recipe_id"]
+                ]
+                if alternatives:
+                    dinner_side_i = max(
+                        alternatives,
+                        key=lambda x:
+                        candidates.iloc[x]["core_pantry"]
+                    )
+
+            plan.append({
+                "day": day,
+                "theme": (
+                    "Weekend special / treat meal"
+                    if special
+                    else "Pantry-first balanced day"
+                ),
+                "is_special_day": special,
+                "breakfast": serialize(
+                    breakfast_i
+                ),
+                "lunch_main": serialize(
+                    lunch_i
+                ),
+                "lunch_side": serialize(
+                    lunch_side_i
+                ),
+                "dinner_main": serialize(
+                    dinner_i,
+                    special
+                ),
+                "dinner_side": serialize(
+                    dinner_side_i,
+                    special
+                )
+            })
+
+        # Snacks are selected separately from a pantry-grounded snack pool.
+        if include_snacks and not snack_pool.empty:
+            snack_pool = snack_pool.copy()
+
+            snack_pool["_snack_score"] = (
+                0.45 * snack_pool["core_pantry"] +
+                0.20 * snack_pool["pantry"] +
+                0.15 * snack_pool["expiry"] +
+                0.10 * snack_pool["nutrition"] +
+                0.10 * snack_pool["ml"]
+            )
+
+            snack_pool = snack_pool.sort_values(
+                "_snack_score",
+                ascending=False
+            ).drop_duplicates(
+                "recipe_id"
+            ).reset_index(drop=True)
+
+            for i, day_plan in enumerate(plan):
+                row = snack_pool.iloc[
+                    i % len(snack_pool)
+                ]
+
+                # Find corresponding candidate row.
+                candidate_matches = candidates.index[
+                    candidates["recipe_id"].astype(str) ==
+                    str(row["recipe_id"])
+                ].tolist()
+
+                if candidate_matches:
+                    day_plan["snack"] = serialize(
+                        candidate_matches[0]
+                    )
+                else:
+                    day_plan["snack"] = {
+                        "recipe_id": str(row["recipe_id"]),
+                        "recipe_name": str(row["recipe_name"]),
+                        "suitability_score": round(float(row["ml"]), 4),
+                        "pantry_score": round(float(row["core_pantry"]), 4),
+                        "expiry_score": round(float(row["expiry"]), 4),
+                        "context_score": round(float(row["context"]), 4),
+                        "nutrition_score": round(float(row["nutrition"]), 4),
+                        "purchase_score": round(
+                            1.0 - min(
+                                len(row["missing_core"]) /
+                                max(len(row["ingredients"]), 1),
+                                1.0
+                            ),
+                            4
+                        ),
+                        "matched_pantry": list(
+                            row["matched_pantry"]
+                        )[:15],
+                        "missing_ingredients": list(
+                            row["missing"]
+                        )[:10],
+                        "ingredients": list(row["ingredients"]),
+                        "is_treat": False
+                    }
+
+        all_meals = []
+
+        for day in plan:
+            for key in (
+                "breakfast",
+                "lunch_main",
+                "lunch_side",
+                "dinner_main",
+                "dinner_side",
+                "snack"
+            ):
+                if day.get(key):
+                    all_meals.append(day[key])
+
+        def average(key, default=0.5):
+            if not all_meals:
+                return default
+            return float(
+                np.mean([
+                    float(x.get(key, default))
+                    for x in all_meals
+                ])
+            )
+
+        unique_recipes = len({
+            x["recipe_id"]
+            for x in all_meals
+        })
+
+        # A weekly planner should never claim "0% pantry" when
+        # candidates were pantry-grounded.
+        pantry_utilization = average("pantry_score", 0)
+        expiry_utilization = average("expiry_score", 0)
+
+        return jsonify({
+            "success": True,
+            "context": ctx,
+            "plan": plan,
+            "summary": {
+                "meals_planned": len(all_meals),
+                "unique_recipes": unique_recipes,
+                "pantry_utilization": round(
+                    pantry_utilization * 100, 1
+                ),
+                "expiry_utilization": round(
+                    expiry_utilization * 100, 1
+                ),
+                "nutrition_score": round(
+                    average("nutrition_score") * 100, 1
+                ),
+                "context_score": round(
+                    average("context_score") * 100, 1
+                ),
+                "purchase_burden": round(
+                    (1.0 - average("purchase_score")) * 100,
+                    1
+                ),
+                "algorithm": (
+                    "Pantry-first full-dataset candidate scoring "
+                    "+ RF/HAN signals + NSGA-II multi-objective optimization"
+                ),
+                "optimizer_generations": generations,
+                "optimizer_population": pop_size,
+                "planning_horizon": "7 days",
+                "candidate_recipes_evaluated": int(len(recipes)),
+                "pantry_grounded_candidates": int(len(pantry_candidates)),
+                "pantry_items_received": int(len(pantry_names)),
+                "objectives": [
+                    "pantry coverage",
+                    "expiry utilization",
+                    "learned suitability",
+                    "nutrition",
+                    "context",
+                    "time fit",
+                    "purchase burden",
+                    "ingredient reuse",
+                    "recipe variety"
+                ]
+            }
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+# ===== MEALORA WEEKLY PLANNER V3 END =====
+
+@app.route("/api/recipe-assistant", methods=["POST"])
+def recipe_assistant():
+    try:
+        data = request.get_json() or {}
+
+        recipe = _get_recipe_for_gemini(
+            recipe_id=data.get("recipe_id"),
+            recipe_name=data.get("recipe_name"),
+        )
+
+        language = data.get("language", "English")
+
+        # English NEVER calls Gemini.
+        if str(language).strip().lower() == "english":
+            result = {
+                "recipe_id": recipe.get("recipe_id"),
+                "recipe_name": recipe.get("recipe_name"),
+                "language": "English",
+                "ingredients": recipe.get("ingredients", []),
+                "instructions": recipe.get("instructions", []),
+                "note": "Recipe presented directly from Mealora's recipe dataset.",
+                "source": "Mealora recipe dataset",
+            }
+
+            return jsonify({
+                "success": True,
+                "assistant_role": "recipe_presentation",
+                "recipe": result,
+            })
+
+        # Non-English: Gemini with one retry.
+        last_error = None
+
+        for attempt in range(2):
+            try:
+                result = _gemini_translate_recipe(recipe, language)
+
+                return jsonify({
+                    "success": True,
+                    "assistant_role": "translation_and_recipe_presentation_only",
+                    "recipe": result,
+                })
+
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"Gemini recipe presentation attempt "
+                    f"{attempt + 1}/2 failed: {exc}"
+                )
+
+                if attempt == 0:
+                    import time
+                    time.sleep(1.0)
+
+        # Gemini unavailable: return original English recipe.
+        fallback = {
+            "recipe_id": recipe.get("recipe_id"),
+            "recipe_name": recipe.get("recipe_name"),
+            "language": "English",
+            "ingredients": recipe.get("ingredients", []),
+            "instructions": recipe.get("instructions", []),
+            "note": (
+                "The selected language service is temporarily unavailable. "
+                "Mealora is showing the original recipe in English."
+            ),
+            "source": "Mealora recipe dataset (English fallback)",
+            "translation_error": str(last_error) if last_error else "",
+        }
+
+        return jsonify({
+            "success": True,
+            "assistant_role": "recipe_presentation_with_translation_fallback",
+            "recipe": fallback,
+        })
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+        }), 500
+
+
+@app.route("/api/recommendations", methods=["POST"])
+def recommendations():
+    try:
+        data = request.get_json() or {}
+        ctx = build_context(data)
+
+        result = recommend(
+            reference_recipe=data.get("reference_recipe", "Balu shahi"),
+            target_user=int(data.get("target_user", 1)),
+            top_k=int(data.get("top_k", 10)),
+            meal_type=ctx["meal_type"],
+            diet=ctx["diet"],
+            cuisine=ctx["cuisine"],
+            max_time=ctx["max_time"],
+            weather=ctx["weather"],
+            festival=ctx["festival"],
+            location={
+                "city": ctx["location_city"],
+                "location_city": ctx["location_city"],
+                "latitude": ctx["latitude"],
+                "longitude": ctx["longitude"],
+                "cuisine_hint": cuisine_hint(ctx["latitude"], ctx["longitude"])
+            }
+        )
+
+        festival_special = _get_festival_special(ctx["festival"].get("name"))
+
+        return jsonify({
+            "success": True,
+            "mode": ctx["mode"],
+            "reference_recipe": data.get("reference_recipe", "Balu shahi"),
+            "target_user": int(data.get("target_user", 1)),
+            "context": ctx,
+            "festival_special": festival_special,
+            "recommendations": result.to_dict(orient="records")
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============================================================
+# LEFTOVER INTELLIGENCE
+# ============================================================
+# Reuse-first logic: search the same Mealora recipe dataset for
+# recipes whose ingredient list contains the reported leftover.
+# This is a lightweight ingredient-compatibility algorithm, not
+# a second recipe recommender that replaces the main ML engine.
+# ============================================================
+
+def _leftover_tokens(value):
+    import re
+    stop = {
+        "leftover", "leftovers", "cooked", "cooking", "food", "some",
+        "the", "and", "with", "of", "a", "an", "to", "from"
+    }
+    text = _normalize_lookup_text(value)
+    return {x for x in text.split() if len(x) >= 3 and x not in stop}
+
+
+def _ingredient_column(df):
+    return _recipe_column(df, [
+        "ingredients", "ingredient_names", "ingredient_list",
+        "Cleaned-Ingredients", "TranslatedIngredients"
+    ])
+
+
+def _recipe_name_column(df):
+    return _recipe_column(df, ["recipe_name", "name", "title", "final_food_name"])
+
+
+def _leftover_recommendations(leftover, top_k=6):
+    import pandas as pd
+    import re
+
+    if not os.path.exists(RECIPE_DATASET):
+        raise FileNotFoundError(f"Recipe dataset not found: {RECIPE_DATASET}")
+
+    df = pd.read_csv(RECIPE_DATASET, low_memory=False)
+    name_col = _recipe_name_column(df)
+    ing_col = _ingredient_column(df)
+    id_col = _recipe_column(df, ["recipe_id", "id"])
+
+    if not name_col or not ing_col:
+        raise RuntimeError("Recipe dataset does not contain recipe name and ingredient columns.")
+
+    leftover_tokens = _leftover_tokens(leftover)
+    if not leftover_tokens:
+        return []
+
+    results = []
+    for idx, row in df[[name_col, ing_col] + ([id_col] if id_col else [])].iterrows():
+        raw = str(row[ing_col]) if row[ing_col] == row[ing_col] else ""
+        if not raw:
+            continue
+
+        ingredient_text = _normalize_lookup_text(raw)
+        ingredient_tokens = set(ingredient_text.split())
+        if not ingredient_tokens:
+            continue
+
+        # Whole leftover phrase gets the strongest signal.
+        normalized_leftover = _normalize_lookup_text(leftover)
+        phrase_match = normalized_leftover and normalized_leftover in ingredient_text
+        token_matches = leftover_tokens.intersection(ingredient_tokens)
+
+        # Also allow singular/plural and simple Indian ingredient wording.
+        expanded_matches = set(token_matches)
+        for token in leftover_tokens:
+            if token.endswith("s") and token[:-1] in ingredient_tokens:
+                expanded_matches.add(token[:-1])
+            elif f"{token}s" in ingredient_tokens:
+                expanded_matches.add(f"{token}s")
+
+        if not phrase_match and not expanded_matches:
+            continue
+
+        token_score = len(expanded_matches) / max(len(leftover_tokens), 1)
+        score = 0.75 * token_score + (0.25 if phrase_match else 0.0)
+        if score <= 0:
+            continue
+
+        name = str(row[name_col]).strip()
+        if not name:
+            continue
+
+        # Prefer recipes where the leftover appears as an ingredient phrase,
+        # then by the number of matched leftover terms.
+        results.append({
+            "recipe_id": str(row[id_col]) if id_col else str(idx),
+            "recipe_name": name,
+            "match_score": round(min(score, 1.0), 4),
+            "matched_ingredients": sorted(expanded_matches),
+            "cuisine": str(row["cuisine"]).strip() if "cuisine" in df.columns and row["cuisine"] == row["cuisine"] else "",
+            "meal_type": str(row["meal_type"]).strip() if "meal_type" in df.columns and row["meal_type"] == row["meal_type"] else "",
+        })
+
+    results.sort(key=lambda x: (-x["match_score"], x["recipe_name"].lower()))
+
+    # Remove duplicate recipe names caused by multiple source records.
+    unique = []
+    seen = set()
+    for item in results:
+        key = _normalize_lookup_text(item["recipe_name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+        if len(unique) >= max(1, min(int(top_k), 20)):
+            break
+
+    return unique
+
+
+@app.route("/api/leftover-recommendations", methods=["POST"])
+def leftover_recommendations():
+    """
+    Leftover-specific ML recommendation.
+
+    1. TF-IDF + cosine similarity finds recipes semantically
+       related to the leftover.
+    2. Ingredient overlap measures actual leftover coverage.
+    3. Mealora's trained suitability model (HGB/RF when
+       available) provides an additional ML suitability signal.
+    """
+    try:
+        import pandas as pd
+        import numpy as np
+
+        data = request.get_json() or {}
+
+        leftover = str(
+            data.get("leftover", "")
+        ).strip()
+
+        top_k = int(
+            data.get("top_k", 6)
+        )
+
+        if not leftover:
+            return jsonify({
+                "success": False,
+                "error": "Leftover ingredient is required."
+            }), 400
+
+        if not os.path.exists(RECIPE_DATASET):
+            raise FileNotFoundError(
+                f"Recipe dataset not found: {RECIPE_DATASET}"
+            )
+
+        df = pd.read_csv(
+            RECIPE_DATASET,
+            low_memory=False
+        )
+
+        def col(candidates):
+            for c in candidates:
+                if c in df.columns:
+                    return c
+            return None
+
+        name_col = col(
+            ["recipe_name", "name", "title"]
+        )
+
+        ingredients_col = col(
+            [
+                "ingredients",
+                "ingredient_names",
+                "ingredient_list"
+            ]
+        )
+
+        instructions_col = col(
+            [
+                "instructions",
+                "directions",
+                "steps",
+                "method"
+            ]
+        )
+
+        cuisine_col = col(
+            ["cuisine", "cuisine_type"]
+        )
+
+        meal_col = col(
+            ["meal_type", "meal"]
+        )
+
+        id_col = col(
+            ["recipe_id", "id"]
+        )
+
+        time_col = col(
+            [
+                "cooking_time_minutes",
+                "cooking_time",
+                "prep_time"
+            ]
+        )
+
+        if not name_col or not ingredients_col:
+            raise ValueError(
+                "Required recipe columns are missing."
+            )
+
+        def clean(value):
+            if value is None:
+                return ""
+
+            try:
+                if pd.isna(value):
+                    return ""
+            except Exception:
+                pass
+
+            return str(value).strip()
+
+        names = df[name_col].fillna("").astype(str)
+        ingredient_text = (
+            df[ingredients_col]
+            .fillna("")
+            .astype(str)
+        )
+
+        # ====================================================
+        # TF-IDF + COSINE SIMILARITY
+        # ====================================================
+
+        corpus = (
+            names + " " + ingredient_text
+        ).tolist()
+
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=(1, 2),
+            min_df=1,
+        )
+
+        matrix = vectorizer.fit_transform(
+            corpus + [leftover]
+        )
+
+        tfidf_scores = cosine_similarity(
+            matrix[-1],
+            matrix[:-1]
+        ).flatten()
+
+        # ====================================================
+        # ACTUAL INGREDIENT TOKEN OVERLAP
+        # ====================================================
+
+        query_tokens = set(
+            re.findall(
+                r"[a-zA-Z]+",
+                leftover.lower()
+            )
+        )
+
+        overlap_scores = []
+
+        for text_value in ingredient_text:
+            recipe_tokens = set(
+                re.findall(
+                    r"[a-zA-Z]+",
+                    str(text_value).lower()
+                )
+            )
+
+            if not query_tokens:
+                overlap_scores.append(0.0)
+                continue
+
+            overlap_scores.append(
+                len(query_tokens & recipe_tokens)
+                / len(query_tokens)
+            )
+
+        overlap_scores = np.asarray(
+            overlap_scores,
+            dtype=float
+        )
+
+        # ====================================================
+        # ML SUITABILITY MODEL
+        # ====================================================
+
+        ml_scores = np.zeros(
+            len(df),
+            dtype=float
+        )
+
+        model = None
+
+        for model_path in [
+            os.path.join(
+                os.path.dirname(
+                    os.path.abspath(__file__)
+                ),
+                "..",
+                "datasets",
+                "processed",
+                "mealora_hgb_model.joblib"
+            ),
+            os.path.join(
+                os.path.dirname(
+                    os.path.abspath(__file__)
+                ),
+                "..",
+                "datasets",
+                "processed",
+                "mealora_rf_model.joblib"
+            ),
+        ]:
+
+            if os.path.exists(model_path):
+                try:
+                    model = joblib.load(
+                        model_path
+                    )
+                    break
+                except Exception:
+                    model = None
+
+        if model is not None:
+
+            feature_names = [
+                "pantry_match_pct",
+                "missing_ingredient_count",
+                "expiry_score",
+                "meal_match",
+                "diet_match",
+                "cuisine_match",
+                "time_match",
+                "context_score",
+                "ingredient_count",
+                "cooking_time_minutes",
+            ]
+
+            features = pd.DataFrame(
+                0.0,
+                index=df.index,
+                columns=feature_names
+            )
+
+            features[
+                "pantry_match_pct"
+            ] = np.clip(
+                overlap_scores,
+                0,
+                1
+            )
+
+            features[
+                "missing_ingredient_count"
+            ] = (
+                1.0 -
+                features["pantry_match_pct"]
+            )
+
+            features["expiry_score"] = 0.0
+            features["meal_match"] = 0.5
+            features["diet_match"] = 0.5
+            features["cuisine_match"] = 0.5
+            features["time_match"] = 0.5
+            features["context_score"] = 0.5
+
+            features[
+                "ingredient_count"
+            ] = ingredient_text.apply(
+                lambda x: max(
+                    1,
+                    len(
+                        re.findall(
+                            r",|;|\n",
+                            str(x)
+                        )
+                    ) + 1
+                )
+            )
+
+            if time_col:
+                features[
+                    "cooking_time_minutes"
+                ] = pd.to_numeric(
+                    df[time_col],
+                    errors="coerce"
+                ).fillna(30)
+
+            try:
+                if hasattr(
+                    model,
+                    "predict_proba"
+                ):
+                    ml_scores = model.predict_proba(
+                        features
+                    )[:, 1]
+                else:
+                    ml_scores = model.predict(
+                        features
+                    ).astype(float)
+
+                ml_scores = np.nan_to_num(
+                    ml_scores,
+                    nan=0.0
+                )
+
+                ml_scores = np.clip(
+                    ml_scores,
+                    0,
+                    1
+                )
+
+            except Exception as model_error:
+                print(
+                    "Leftover ML model warning:",
+                    model_error
+                )
+
+        # ====================================================
+        # FINAL LEFTOVER SCORE
+        # ====================================================
+
+        final_scores = (
+            0.55 * tfidf_scores
+            + 0.25 * overlap_scores
+            + 0.20 * ml_scores
+        )
+
+        # Strongly prioritize recipes that actually contain
+        # the leftover token.
+        final_scores += (
+            0.10 *
+            (overlap_scores > 0).astype(float)
+        )
+
+        df["_leftover_score"] = final_scores
+        df["_tfidf_score"] = tfidf_scores
+        df["_overlap_score"] = overlap_scores
+        df["_ml_score"] = ml_scores
+
+        df = df.sort_values(
+            "_leftover_score",
+            ascending=False
+        )
+
+        # Avoid completely unrelated zero-match recipes.
+        df = df[
+            (df["_overlap_score"] > 0)
+            | (df["_tfidf_score"] > 0)
+        ].head(top_k)
+
+        recommendations = []
+
+        for _, row in df.iterrows():
+
+            raw_ingredients = (
+                clean(
+                    row[ingredients_col]
+                )
+                if ingredients_col
+                else ""
+            )
+
+            raw_instructions = (
+                clean(
+                    row[instructions_col]
+                )
+                if instructions_col
+                else ""
+            )
+
+            def split_lines(value):
+                if not value:
+                    return []
+
+                value = value.replace(
+                    "\r",
+                    "\n"
+                )
+
+                if ";" in value and "\n" not in value:
+                    parts = value.split(";")
+                else:
+                    parts = value.split("\n")
+
+                return [
+                    x.strip(" •\t-")
+                    for x in parts
+                    if x.strip(" •\t-")
+                ]
+
+            recipe_id = (
+                clean(row[id_col])
+                if id_col
+                else ""
+            )
+
+            matched = []
+
+            for token in query_tokens:
+                if token in raw_ingredients.lower():
+                    matched.append(token)
+
+            recommendations.append({
+                "recipe_id": recipe_id,
+                "recipe_name": clean(
+                    row[name_col]
+                ),
+                "match_score": float(
+                    np.clip(
+                        row["_leftover_score"],
+                        0,
+                        1
+                    )
+                ),
+                "tfidf_score": float(
+                    np.clip(
+                        row["_tfidf_score"],
+                        0,
+                        1
+                    )
+                ),
+                "ml_score": float(
+                    np.clip(
+                        row["_ml_score"],
+                        0,
+                        1
+                    )
+                ),
+                "matched_ingredients": matched,
+                "ingredients": split_lines(
+                    raw_ingredients
+                ),
+                "instructions": split_lines(
+                    raw_instructions
+                ),
+                "cuisine": (
+                    clean(row[cuisine_col])
+                    if cuisine_col
+                    else ""
+                ),
+                "meal_type": (
+                    clean(row[meal_col])
+                    if meal_col
+                    else ""
+                ),
+            })
+
+        return jsonify({
+            "success": True,
+            "algorithm": (
+                "TF-IDF + Cosine Similarity + "
+                "Mealora ML Suitability"
+            ),
+            "recommendations": recommendations
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+if __name__ == "__main__":
+    print("=" * 60)
+    print("MEALORA BACKEND API")
+    print("http://127.0.0.1:5000")
+    print("=" * 60)
+    app.run(host="127.0.0.1", port=5000, debug=True)

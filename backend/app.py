@@ -1961,460 +1961,371 @@ def _leftover_recommendations(leftover, top_k=6):
     return unique
 
 
+
 @app.route("/api/leftover-recommendations", methods=["POST"])
 def leftover_recommendations():
     """
-    Leftover-specific ML recommendation.
-
-    1. TF-IDF + cosine similarity finds recipes semantically
-       related to the leftover.
-    2. Ingredient overlap measures actual leftover coverage.
-    3. Mealora's trained suitability model (HGB/RF when
-       available) provides an additional ML suitability signal.
+    Leftover reuse recommendations:
+    - ingredient similarity + transformation-intent ranking
+    - optional existing Mealora ML suitability model
+    - deduplication before top-k selection
+    - real nutrition values from recipe_master_dataset.csv
+    No location, weather, festival or regional-cuisine features are used.
     """
     try:
-        import pandas as pd
-        import numpy as np
-
-        data = request.get_json() or {}
-
-        leftover = str(
-            data.get("leftover", "")
-        ).strip()
-
-        top_k = int(
-            data.get("top_k", 6)
-        )
+        data = request.get_json(silent=True) or {}
+        leftover = str(data.get("leftover", "")).strip()
+        try:
+            top_k = max(1, min(int(data.get("top_k", 3)), 3))
+        except (TypeError, ValueError):
+            top_k = 3
 
         if not leftover:
-            return jsonify({
-                "success": False,
-                "error": "Leftover ingredient is required."
-            }), 400
+            return jsonify({"success": False, "error": "Enter a leftover food or ingredient."}), 400
 
-        if not os.path.exists(RECIPE_DATASET):
-            raise FileNotFoundError(
-                f"Recipe dataset not found: {RECIPE_DATASET}"
-            )
+        df = get_recipe_df().copy()
+        if df.empty:
+            return jsonify({"success": True, "recommendations": []})
 
-        df = pd.read_csv(
-            RECIPE_DATASET,
-            low_memory=False
-        )
-
-        def col(candidates):
-            for c in candidates:
-                if c in df.columns:
-                    return c
+        def find_col(candidates):
+            columns = {str(c).strip().lower(): c for c in df.columns}
+            for candidate in candidates:
+                if candidate.lower() in columns:
+                    return columns[candidate.lower()]
             return None
 
-        name_col = col(
-            ["recipe_name", "name", "title"]
-        )
-
-        ingredients_col = col(
-            [
-                "ingredients",
-                "ingredient_names",
-                "ingredient_list"
-            ]
-        )
-
-        instructions_col = col(
-            [
-                "instructions",
-                "directions",
-                "steps",
-                "method"
-            ]
-        )
-
-        cuisine_col = col(
-            ["cuisine", "cuisine_type"]
-        )
-
-        meal_col = col(
-            ["meal_type", "meal"]
-        )
-
-        id_col = col(
-            ["recipe_id", "id"]
-        )
-
-        time_col = col(
-            [
-                "cooking_time_minutes",
-                "cooking_time",
-                "prep_time"
-            ]
-        )
-
+        name_col = find_col(["recipe_name", "name", "title", "dish_name"])
+        ingredients_col = find_col(["ingredients", "ingredient_list", "ingredient_names", "ingredients_clean", "canonical_ingredients"])
+        instructions_col = find_col(["instructions", "directions", "steps", "method"])
+        id_col = find_col(["recipe_id", "id"])
+        cuisine_col = find_col(["cuisine", "cuisine_type"])
+        meal_col = find_col(["meal_type", "meal"])
+        time_col = find_col(["cooking_time_minutes", "total_time", "cook_time", "prep_time"])
+        nutrition_columns = {
+            "calories": find_col(["calories", "calorie"]),
+            "carbohydrates": find_col(["carbohydrates", "carbs", "carbohydrate"]),
+            "protein": find_col(["protein"]),
+            "fat": find_col(["fat", "total_fat"]),
+            "fibre": find_col(["fibre", "fiber"]),
+            "sodium": find_col(["sodium"]),
+            "calcium": find_col(["calcium"]),
+            "iron": find_col(["iron"]),
+            "vitamin_c": find_col(["vitamin_c", "vitamin c"]),
+            "folate": find_col(["folate"]),
+        }
         if not name_col or not ingredients_col:
-            raise ValueError(
-                "Required recipe columns are missing."
-            )
+            raise ValueError("Dataset needs recipe_name and ingredients/ingredient_list columns.")
 
         def clean(value):
             if value is None:
                 return ""
-
             try:
                 if pd.isna(value):
                     return ""
-            except Exception:
+            except (TypeError, ValueError):
                 pass
-
             return str(value).strip()
 
-        names = df[name_col].fillna("").astype(str)
-        ingredient_text = (
-            df[ingredients_col]
-            .fillna("")
-            .astype(str)
-        )
+        def normalize(value):
+            text = clean(value).lower()
+            text = text.replace("&", " and ")
+            text = re.sub(r"[^a-z0-9]+", " ", text)
+            return re.sub(r"\s+", " ", text).strip()
 
-        # ====================================================
-        # TF-IDF + COSINE SIMILARITY
-        # ====================================================
+        def parse_items(value):
+            if isinstance(value, list):
+                return [clean(v) for v in value if clean(v)]
+            text = clean(value)
+            if not text:
+                return []
+            if text.startswith("[") and text.endswith("]"):
+                for parser in (json.loads, ast.literal_eval):
+                    try:
+                        parsed = parser(text)
+                        if isinstance(parsed, list):
+                            return [clean(v) for v in parsed if clean(v)]
+                    except Exception:
+                        pass
+            parts = re.split(r"\n|;|\|", text)
+            if len(parts) == 1 and "," in text:
+                parts = text.split(",")
+            return [p.strip(" •\t-") for p in parts if p.strip(" •\t-")]
 
-        corpus = (
-            names + " " + ingredient_text
-        ).tolist()
+        q = normalize(leftover)
+        alias_map = {
+            "rice": {"rice", "chawal", "bhaat"},
+            "roti": {"roti", "rotis", "chapati", "chapatti", "chappati", "phulka", "rotli", "flatbread"},
+            "paratha": {"paratha", "parantha", "parotta"},
+            "idli": {"idli", "idly"},
+            "dosa": {"dosa", "dosai"},
+        }
+        query_kind = None
+        q_tokens = set(q.split())
+        for canonical, aliases in alias_map.items():
+            if q_tokens.intersection(aliases) or q in aliases:
+                query_kind = canonical
+                break
 
+        if query_kind == "rice":
+            aliases = alias_map["rice"]
+            transformation_phrases = (
+                "fried rice", "pulao", "pulav", "lemon rice", "jeera rice",
+                "curd rice", "tamarind rice", "tomato rice", "rice cutlet",
+                "rice balls", "rice pakora", "rice pancake"
+            )
+            transformation_priority = {
+                "fried rice": 1.00, "pulao": 0.92, "pulav": 0.92,
+                "rice cutlet": 0.90, "rice balls": 0.88,
+                "rice pakora": 0.88, "rice pancake": 0.85,
+                "lemon rice": 0.80, "tamarind rice": 0.78,
+                "tomato rice": 0.78, "curd rice": 0.72, "jeera rice": 0.62,
+            }
+        elif query_kind == "roti":
+            aliases = alias_map["roti"]
+            transformation_phrases = (
+                "roti cutlet", "roti ka poha", "vaghareli rotli",
+                "vagharela rotli", "kothu roti", "kothu paratha",
+                "chapati noodles", "roti pizza", "roti upma",
+                "leftover roti", "chapati cutlet"
+            )
+            transformation_priority = {
+                "roti cutlet": 1.00, "roti ka poha": 1.00,
+                "vaghareli rotli": 0.98, "vagharela rotli": 0.96,
+                "kothu roti": 0.95, "kothu paratha": 0.92,
+                "chapati noodles": 0.90, "roti pizza": 0.88,
+                "roti upma": 0.88, "chapati cutlet": 0.95,
+                "leftover roti": 0.80,
+            }
+        else:
+            aliases = alias_map.get(query_kind, {q})
+            transformation_phrases = ()
+            transformation_priority = {}
+
+        # Search all recipe text, but give explicit leftover transformations
+        # a strong, transparent ranking boost.
+        # Convert dataset columns defensively. A malformed/duplicate column
+        # selection can return a scalar instead of a pandas Series; calling
+        # .astype() on that scalar raises: "'float' object has no attribute 'astype'".
+        def safe_text_column(column, default=""):
+            if column is None:
+                return pd.Series([default] * len(df), index=df.index, dtype="object")
+            values = df[column]
+            if isinstance(values, pd.DataFrame):
+                # If the CSV contains duplicate column headers, use the first.
+                values = values.iloc[:, 0]
+            if not isinstance(values, pd.Series):
+                values = pd.Series([values] * len(df), index=df.index)
+            return values.fillna(default).map(
+                lambda value: value if isinstance(value, str) else str(value)
+            )
+
+        names = safe_text_column(name_col)
+        ingredient_text = safe_text_column(ingredients_col)
+        canonical_col = find_col(["canonical_ingredients", "ingredients_clean"])
+        canonical_text = safe_text_column(canonical_col) if canonical_col is not None else ingredient_text
+        docs = (names + " " + ingredient_text + " " + canonical_text).tolist()
+
+        query_for_tfidf = " ".join(sorted(set([q] + list(aliases) + list(transformation_phrases))))
         vectorizer = TfidfVectorizer(
-            lowercase=True,
-            stop_words="english",
-            ngram_range=(1, 2),
-            min_df=1,
+            lowercase=True, stop_words="english", ngram_range=(1, 2),
+            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b"
         )
+        matrix = vectorizer.fit_transform(docs + [query_for_tfidf])
+        tfidf_scores = cosine_similarity(matrix[-1], matrix[:-1]).ravel()
 
-        matrix = vectorizer.fit_transform(
-            corpus + [leftover]
-        )
+        def token_set(value):
+            return set(re.findall(r"[a-z]+", normalize(value)))
 
-        tfidf_scores = cosine_similarity(
-            matrix[-1],
-            matrix[:-1]
-        ).flatten()
+        alias_tokens = set()
+        for alias in aliases:
+            alias_tokens.update(token_set(alias))
+        if query_kind:
+            alias_tokens.add(query_kind)
 
-        # ====================================================
-        # ACTUAL INGREDIENT TOKEN OVERLAP
-        # ====================================================
+        candidates = []
+        for pos, (_, row) in enumerate(df.iterrows()):
+            recipe_name = clean(row.get(name_col))
+            if not recipe_name:
+                continue
+            name_norm = normalize(recipe_name)
+            ing_text = clean(row.get(ingredients_col)) + " " + clean(row.get(canonical_col)) if canonical_col else clean(row.get(ingredients_col))
+            ing_norm = normalize(ing_text)
+            name_tokens = token_set(name_norm)
+            ing_tokens = token_set(ing_norm)
 
-        query_tokens = set(
-            re.findall(
-                r"[a-zA-Z]+",
-                leftover.lower()
-            )
-        )
+            # Ingredient match: require a meaningful token, not generic words.
+            matched = sorted(alias_tokens.intersection(ing_tokens))
+            if query_kind:
+                direct_match = bool(matched)
+            else:
+                direct_match = bool(token_set(q).intersection(ing_tokens))
 
-        overlap_scores = []
+            transform_bonus = 0.0
+            for phrase, priority in transformation_priority.items():
+                if phrase in name_norm:
+                    transform_bonus = max(transform_bonus, priority)
 
-        for text_value in ingredient_text:
-            recipe_tokens = set(
-                re.findall(
-                    r"[a-zA-Z]+",
-                    str(text_value).lower()
-                )
-            )
-
-            if not query_tokens:
-                overlap_scores.append(0.0)
+            # Explicit known transformation titles remain eligible even when
+            # the source ingredient list omits the leftover ingredient.
+            title_alias_match = bool(alias_tokens.intersection(name_tokens))
+            if not direct_match and not title_alias_match and transform_bonus <= 0 and tfidf_scores[pos] < 0.025:
                 continue
 
-            overlap_scores.append(
-                len(query_tokens & recipe_tokens)
-                / len(query_tokens)
+            overlap = len(matched) / max(1, len(alias_tokens))
+            # Ranking deliberately favours reuse transformations over generic
+            # dishes that merely happen to contain rice/roti.
+            relevance = (
+                0.38 * float(np.clip(overlap, 0, 1))
+                + 0.17 * float(np.clip(tfidf_scores[pos] * 4.0, 0, 1))
+                + 0.45 * transform_bonus
             )
+            candidates.append({
+                "position": pos, "row": row, "name": recipe_name,
+                "overlap": float(np.clip(overlap, 0, 1)),
+                "tfidf": float(tfidf_scores[pos]),
+                "transform": transform_bonus,
+                "relevance": float(np.clip(relevance, 0, 1)),
+                "matched": matched or ([query_kind] if title_alias_match and query_kind else []),
+            })
 
-        overlap_scores = np.asarray(
-            overlap_scores,
-            dtype=float
-        )
+        if not candidates:
+            return jsonify({
+                "success": True,
+                "algorithm": "Leftover ingredient matching + transformation ranking + optional Mealora ML",
+                "recommendations": []
+            })
 
-        # ====================================================
-        # ML SUITABILITY MODEL
-        # ====================================================
-
-        ml_scores = np.zeros(
-            len(df),
-            dtype=float
-        )
-
+        # Load the existing suitability model, if installed.
         model = None
-
-        for model_path in [
-            os.path.join(
-                os.path.dirname(
-                    os.path.abspath(__file__)
-                ),
-                "..",
-                "datasets",
-                "processed",
-                "mealora_hgb_model.joblib"
-            ),
-            os.path.join(
-                os.path.dirname(
-                    os.path.abspath(__file__)
-                ),
-                "..",
-                "datasets",
-                "processed",
-                "mealora_rf_model.joblib"
-            ),
-        ]:
-
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for model_filename in ("mealora_hgb_model.joblib", "mealora_rf_model.joblib"):
+            model_path = os.path.join(base_dir, "..", "datasets", "processed", model_filename)
             if os.path.exists(model_path):
                 try:
-                    model = joblib.load(
-                        model_path
-                    )
+                    model = joblib.load(model_path)
                     break
-                except Exception:
-                    model = None
+                except Exception as model_error:
+                    print("Leftover ML model load warning:", model_error)
 
+        feature_names = [
+            "pantry_match_pct", "missing_ingredient_count", "expiry_score",
+            "meal_match", "diet_match", "cuisine_match", "time_match",
+            "context_score", "ingredient_count", "cooking_time_minutes"
+        ]
+        ml_scores = np.full(len(candidates), np.nan, dtype=float)
         if model is not None:
-
-            feature_names = [
-                "pantry_match_pct",
-                "missing_ingredient_count",
-                "expiry_score",
-                "meal_match",
-                "diet_match",
-                "cuisine_match",
-                "time_match",
-                "context_score",
-                "ingredient_count",
-                "cooking_time_minutes",
-            ]
-
-            features = pd.DataFrame(
-                0.0,
-                index=df.index,
-                columns=feature_names
-            )
-
-            features[
-                "pantry_match_pct"
-            ] = np.clip(
-                overlap_scores,
-                0,
-                1
-            )
-
-            features[
-                "missing_ingredient_count"
-            ] = (
-                1.0 -
-                features["pantry_match_pct"]
-            )
-
-            features["expiry_score"] = 0.0
-            features["meal_match"] = 0.5
-            features["diet_match"] = 0.5
-            features["cuisine_match"] = 0.5
-            features["time_match"] = 0.5
-            features["context_score"] = 0.5
-
-            features[
-                "ingredient_count"
-            ] = ingredient_text.apply(
-                lambda x: max(
-                    1,
-                    len(
-                        re.findall(
-                            r",|;|\n",
-                            str(x)
-                        )
-                    ) + 1
-                )
-            )
-
-            if time_col:
-                features[
-                    "cooking_time_minutes"
-                ] = pd.to_numeric(
-                    df[time_col],
-                    errors="coerce"
-                ).fillna(30)
-
+            feature_rows = []
+            for item in candidates:
+                row = item["row"]
+                parsed_ingredients = parse_items(row.get(ingredients_col))
+                try:
+                    cook_time = float(row.get(time_col)) if time_col else 30.0
+                    if not np.isfinite(cook_time):
+                        cook_time = 30.0
+                except (TypeError, ValueError):
+                    cook_time = 30.0
+                feature_rows.append({
+                    "pantry_match_pct": item["overlap"],
+                    "missing_ingredient_count": max(0, len(parsed_ingredients) - len(item["matched"])),
+                    "expiry_score": 0.0,
+                    "meal_match": 0.5, "diet_match": 0.5, "cuisine_match": 0.5,
+                    "time_match": 0.5, "context_score": 0.5,
+                    "ingredient_count": max(1, len(parsed_ingredients)),
+                    "cooking_time_minutes": cook_time,
+                })
+            features = pd.DataFrame(feature_rows, columns=feature_names).fillna(0.0)
             try:
-                if hasattr(
-                    model,
-                    "predict_proba"
-                ):
-                    ml_scores = model.predict_proba(
-                        features
-                    )[:, 1]
+                if hasattr(model, "predict_proba"):
+                    prediction = model.predict_proba(features)
+                    ml_scores = prediction[:, 1] if prediction.ndim == 2 and prediction.shape[1] > 1 else prediction.ravel()
                 else:
-                    ml_scores = model.predict(
-                        features
-                    ).astype(float)
-
-                ml_scores = np.nan_to_num(
-                    ml_scores,
-                    nan=0.0
-                )
-
-                ml_scores = np.clip(
-                    ml_scores,
-                    0,
-                    1
-                )
-
+                    ml_scores = np.asarray(model.predict(features), dtype=float).ravel()
+                ml_scores = np.clip(np.nan_to_num(ml_scores, nan=0.5), 0, 1)
             except Exception as model_error:
-                print(
-                    "Leftover ML model warning:",
-                    model_error
-                )
+                print("Leftover ML prediction warning:", model_error)
+                ml_scores[:] = np.nan
 
-        # ====================================================
-        # FINAL LEFTOVER SCORE
-        # ====================================================
+        for i, item in enumerate(candidates):
+            item["ml"] = float(ml_scores[i]) if np.isfinite(ml_scores[i]) else None
+            # Do not fabricate an ML score if the model is absent.
+            item["final"] = (
+                0.82 * item["relevance"] + 0.18 * item["ml"]
+                if item["ml"] is not None else item["relevance"]
+            )
 
-        final_scores = (
-            0.55 * tfidf_scores
-            + 0.25 * overlap_scores
-            + 0.20 * ml_scores
-        )
+        candidates.sort(key=lambda x: (x["final"], x["transform"], x["overlap"], x["tfidf"]), reverse=True)
 
-        # Strongly prioritize recipes that actually contain
-        # the leftover token.
-        final_scores += (
-            0.10 *
-            (overlap_scores > 0).astype(float)
-        )
-
-        df["_leftover_score"] = final_scores
-        df["_tfidf_score"] = tfidf_scores
-        df["_overlap_score"] = overlap_scores
-        df["_ml_score"] = ml_scores
-
-        df = df.sort_values(
-            "_leftover_score",
-            ascending=False
-        )
-
-        # Avoid completely unrelated zero-match recipes.
-        df = df[
-            (df["_overlap_score"] > 0)
-            | (df["_tfidf_score"] > 0)
-        ].head(top_k)
+        def numeric(row, column):
+            if not column:
+                return None
+            try:
+                value = float(row.get(column))
+                return round(value, 2) if np.isfinite(value) else None
+            except (TypeError, ValueError):
+                return None
 
         recommendations = []
+        seen_titles = set()
+        seen_signatures = set()
+        for item in candidates:
+            row = item["row"]
+            title_key = normalize(item["name"])
+            # Collapse duplicate rows and near-identical title variants.
+            title_tokens = tuple(sorted(t for t in title_key.split() if t not in {"recipe", "style", "homemade", "easy"}))
+            if title_key in seen_titles or (title_tokens and title_tokens in seen_signatures):
+                continue
+            seen_titles.add(title_key)
+            seen_signatures.add(title_tokens)
 
-        for _, row in df.iterrows():
+            nutrition = {}
+            for key, column in nutrition_columns.items():
+                value = numeric(row, column)
+                if value is not None:
+                    nutrition[key] = value
 
-            raw_ingredients = (
-                clean(
-                    row[ingredients_col]
-                )
-                if ingredients_col
-                else ""
-            )
+            raw_instructions = row.get(instructions_col) if instructions_col else ""
+            raw_ingredients = row.get(ingredients_col)
+            try:
+                cooking_time = numeric(row, time_col)
+                nutrition_match_score = numeric(row, find_col(["nutrition_match_score", "nutrition_score", "health_score"]))
+                recommendations.append({
+                    "recipe_id": clean(row.get(id_col)) if id_col else str(item["position"]),
+                    "recipe_name": item["name"],
+                    "match_score": round(item["relevance"], 4),
+                    "tfidf_score": round(item["tfidf"], 4),
+                    "ml_score": round(item["ml"], 4) if item["ml"] is not None else None,
+                    "final_score": round(item["final"], 4),
+                    "matched_ingredients": item["matched"],
+                    "ingredients": parse_items(raw_ingredients),
+                    "instructions": parse_items(raw_instructions),
+                    "cuisine": clean(row.get(cuisine_col)) if cuisine_col else "",
+                    "meal_type": clean(row.get(meal_col)) if meal_col else "",
+                    "cooking_time_minutes": cooking_time,
+                    "nutrition": nutrition,
+                    "nutrition_match_score": nutrition_match_score,
+                    "nutrition_available": bool(nutrition),
+                })
+            except Exception as row_error:
+                print("Skipping malformed leftover recipe row:", row_error)
+                continue
 
-            raw_instructions = (
-                clean(
-                    row[instructions_col]
-                )
-                if instructions_col
-                else ""
-            )
-
-            def split_lines(value):
-                if not value:
-                    return []
-
-                value = value.replace(
-                    "\r",
-                    "\n"
-                )
-
-                if ";" in value and "\n" not in value:
-                    parts = value.split(";")
-                else:
-                    parts = value.split("\n")
-
-                return [
-                    x.strip(" •\t-")
-                    for x in parts
-                    if x.strip(" •\t-")
-                ]
-
-            recipe_id = (
-                clean(row[id_col])
-                if id_col
-                else ""
-            )
-
-            matched = []
-
-            for token in query_tokens:
-                if token in raw_ingredients.lower():
-                    matched.append(token)
-
-            recommendations.append({
-                "recipe_id": recipe_id,
-                "recipe_name": clean(
-                    row[name_col]
-                ),
-                "match_score": float(
-                    np.clip(
-                        row["_leftover_score"],
-                        0,
-                        1
-                    )
-                ),
-                "tfidf_score": float(
-                    np.clip(
-                        row["_tfidf_score"],
-                        0,
-                        1
-                    )
-                ),
-                "ml_score": float(
-                    np.clip(
-                        row["_ml_score"],
-                        0,
-                        1
-                    )
-                ),
-                "matched_ingredients": matched,
-                "ingredients": split_lines(
-                    raw_ingredients
-                ),
-                "instructions": split_lines(
-                    raw_instructions
-                ),
-                "cuisine": (
-                    clean(row[cuisine_col])
-                    if cuisine_col
-                    else ""
-                ),
-                "meal_type": (
-                    clean(row[meal_col])
-                    if meal_col
-                    else ""
-                ),
-            })
+            if len(recommendations) >= top_k:
+                break
 
         return jsonify({
             "success": True,
-            "algorithm": (
-                "TF-IDF + Cosine Similarity + "
-                "Mealora ML Suitability"
-            ),
-            "recommendations": recommendations
+            "algorithm": "Ingredient relevance + leftover transformation priority + optional Mealora ML suitability",
+            "scoring_basis": "leftover ingredient and recipe reuse suitability only; no location/context scoring",
+            "ml_model_available": model is not None,
+            "recommendations": _json_safe(recommendations)
         })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
 
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+
 if __name__ == "__main__":
     print("=" * 60)
     print("MEALORA BACKEND API")

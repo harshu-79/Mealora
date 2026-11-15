@@ -67,7 +67,8 @@ export default function LeftoverDonation({
           leftover: value,
           quantity: quantity || null,
           unit,
-          top_k: 6,
+          top_k: 3,
+          pantry: pantryItems,
         }),
       });
 
@@ -156,9 +157,8 @@ export default function LeftoverDonation({
             color: "#64748b",
           }}
         >
-          Mealora uses ML-based ingredient similarity and
-          suitability scoring to find recipes that can reuse
-          your leftover before suggesting donation.
+          Find recipes using ingredient similarity, leftover matching
+          and the ingredients already available in your pantry.
         </p>
       </div>
 
@@ -309,7 +309,7 @@ export default function LeftoverDonation({
             disabled={loading}
           >
             {loading
-              ? "Finding ML reuse matches..."
+              ? "Finding reuse recipes..."
               : "🔎 Find Reuse Recipes"}
           </button>
 
@@ -341,7 +341,7 @@ export default function LeftoverDonation({
       {results.length > 0 && (
         <div style={{ marginTop: 26 }}>
 
-          <h3>🍳 ML-Powered Reuse Suggestions</h3>
+          <h3>🍳 Your best reuse ideas</h3>
 
           <p
             style={{
@@ -349,9 +349,8 @@ export default function LeftoverDonation({
               fontSize: 13,
             }}
           >
-            Mealora combines TF-IDF cosine similarity with
-            ML suitability scoring to rank recipes for the
-            entered leftover.
+            Recipes are ranked using TF-IDF similarity, leftover relevance
+            and the ingredients already available in your pantry.
           </p>
 
           <div
@@ -395,54 +394,41 @@ export default function LeftoverDonation({
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns:
-                      "repeat(2, minmax(0, 1fr))",
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
                     gap: 8,
                     marginBottom: 12,
                   }}
                 >
-
-                  <div
-                    style={{
-                      padding: 9,
-                      borderRadius: 9,
-                      background: "#f0fdf4",
-                      fontSize: 12,
-                    }}
-                  >
-                    <strong>
-                      {Math.round(
-                        Number(
-                          recipe.match_score || 0
-                        ) * 100
-                      )}
-                      %
-                    </strong>
-                    <br />
-                    Ingredient match
+                  <div style={{ padding: 9, borderRadius: 9, background: "#f0fdf4", fontSize: 12 }}>
+                    <strong>{recipe.available_ingredient_count ?? 0} / {recipe.ingredient_count ?? 0}</strong>
+                    <br />Ingredients available
                   </div>
-
-                  <div
-                    style={{
-                      padding: 9,
-                      borderRadius: 9,
-                      background: "#eff6ff",
-                      fontSize: 12,
-                    }}
-                  >
-                    <strong>
-                      {Math.round(
-                        Number(
-                          recipe.ml_score || 0
-                        ) * 100
-                      )}
-                      %
-                    </strong>
-                    <br />
-                    ML suitability
+                  <div style={{ padding: 9, borderRadius: 9, background: "#fff7ed", fontSize: 12 }}>
+                    <strong>{recipe.missing_ingredient_count ?? 0}</strong>
+                    <br />Ingredients missing
                   </div>
-
                 </div>
+
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 5 }}>
+                    <strong>Pantry coverage</strong>
+                    <strong>{Math.round(Number(recipe.ingredient_coverage_pct || 0))}%</strong>
+                  </div>
+                  <div style={{ height: 8, borderRadius: 99, background: "#e2e8f0", overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, Number(recipe.ingredient_coverage_pct || 0)))}%`, background: "#16a34a", borderRadius: 99 }} />
+                  </div>
+                </div>
+
+                {recipe.available_ingredients?.length > 0 && (
+                  <p style={{ fontSize: 13, color: "#166534", lineHeight: 1.5 }}>
+                    <strong>Available:</strong> {recipe.available_ingredients.join(", ")}
+                  </p>
+                )}
+                {recipe.missing_ingredients?.length > 0 && (
+                  <p style={{ fontSize: 13, color: "#9a3412", lineHeight: 1.5 }}>
+                    <strong>Missing:</strong> {recipe.missing_ingredients.join(", ")}
+                  </p>
+                )}
 
                 {recipe.matched_ingredients?.length > 0 && (
                   <p

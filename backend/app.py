@@ -1967,7 +1967,7 @@ def leftover_recommendations():
     """
     Leftover reuse recommendations:
     - ingredient similarity + transformation-intent ranking
-    - optional existing Mealora ML suitability model
+    - pantry availability and missing-ingredient counts
     - deduplication before top-k selection
     - real nutrition values from recipe_master_dataset.csv
     No location, weather, festival or regional-cuisine features are used.
@@ -2195,63 +2195,70 @@ def leftover_recommendations():
                 "recommendations": []
             })
 
-        # Load the existing suitability model, if installed.
-        model = None
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        for model_filename in ("mealora_hgb_model.joblib", "mealora_rf_model.joblib"):
-            model_path = os.path.join(base_dir, "..", "datasets", "processed", model_filename)
-            if os.path.exists(model_path):
-                try:
-                    model = joblib.load(model_path)
-                    break
-                except Exception as model_error:
-                    print("Leftover ML model load warning:", model_error)
+        # Leftover Intelligence uses transparent retrieval/ranking signals.
+        # The general suitability model is trained for a different task, so it
+        # must not be presented as a leftover-specific ML prediction.
+        pantry_entries = data.get("pantry") or []
+        pantry_names = []
+        for entry in pantry_entries:
+            if isinstance(entry, dict):
+                pantry_name = entry.get("normalized_name") or entry.get("ingredient_name") or entry.get("name") or ""
+            else:
+                pantry_name = str(entry or "")
+            pantry_name = clean(pantry_name)
+            if pantry_name:
+                pantry_names.append(pantry_name)
+        pantry_names.append(leftover)
 
-        feature_names = [
-            "pantry_match_pct", "missing_ingredient_count", "expiry_score",
-            "meal_match", "diet_match", "cuisine_match", "time_match",
-            "context_score", "ingredient_count", "cooking_time_minutes"
-        ]
-        ml_scores = np.full(len(candidates), np.nan, dtype=float)
-        if model is not None:
-            feature_rows = []
-            for item in candidates:
-                row = item["row"]
-                parsed_ingredients = parse_items(row.get(ingredients_col))
-                try:
-                    cook_time = float(row.get(time_col)) if time_col else 30.0
-                    if not np.isfinite(cook_time):
-                        cook_time = 30.0
-                except (TypeError, ValueError):
-                    cook_time = 30.0
-                feature_rows.append({
-                    "pantry_match_pct": item["overlap"],
-                    "missing_ingredient_count": max(0, len(parsed_ingredients) - len(item["matched"])),
-                    "expiry_score": 0.0,
-                    "meal_match": 0.5, "diet_match": 0.5, "cuisine_match": 0.5,
-                    "time_match": 0.5, "context_score": 0.5,
-                    "ingredient_count": max(1, len(parsed_ingredients)),
-                    "cooking_time_minutes": cook_time,
-                })
-            features = pd.DataFrame(feature_rows, columns=feature_names).fillna(0.0)
-            try:
-                if hasattr(model, "predict_proba"):
-                    prediction = model.predict_proba(features)
-                    ml_scores = prediction[:, 1] if prediction.ndim == 2 and prediction.shape[1] > 1 else prediction.ravel()
-                else:
-                    ml_scores = np.asarray(model.predict(features), dtype=float).ravel()
-                ml_scores = np.clip(np.nan_to_num(ml_scores, nan=0.5), 0, 1)
-            except Exception as model_error:
-                print("Leftover ML prediction warning:", model_error)
-                ml_scores[:] = np.nan
-
-        for i, item in enumerate(candidates):
-            item["ml"] = float(ml_scores[i]) if np.isfinite(ml_scores[i]) else None
-            # Do not fabricate an ML score if the model is absent.
-            item["final"] = (
-                0.82 * item["relevance"] + 0.18 * item["ml"]
-                if item["ml"] is not None else item["relevance"]
+        def ingredient_key(value):
+            text = normalize(value)
+            text = re.sub(
+                r"^\d+(?:\.\d+)?\s*(?:kg|g|mg|l|ml|litre|liter|cup|cups|tbsp|tsp|tablespoon|teaspoon|piece|pieces|pcs|pc|oz|lb)?\s*(?:of\s+)?",
+                "", text
             )
+            text = re.sub(
+                r"\b(finely|roughly|thinly|thickly|chopped|sliced|diced|minced|grated|crushed|ground|fresh|small|medium|large|optional|to taste)\b",
+                " ", text
+            )
+            text = re.sub(r"\s+", " ", text).strip()
+            aliases = {
+                "dahi": "yogurt", "curd": "yogurt", "yoghurt": "yogurt",
+                "capsicum": "bell pepper", "coriander leaves": "cilantro",
+                "coriander leaf": "cilantro", "chilli": "chili",
+            }
+            return aliases.get(text, text)
+
+        pantry_keys = {ingredient_key(x) for x in pantry_names if ingredient_key(x)}
+
+        def is_available(ingredient):
+            key = ingredient_key(ingredient)
+            if not key:
+                return False
+            if key in pantry_keys:
+                return True
+            variants = {key}
+            if key.endswith("ies") and len(key) > 4:
+                variants.add(key[:-3] + "y")
+            elif key.endswith("s") and len(key) > 3:
+                variants.add(key[:-1])
+            else:
+                variants.add(key + "s")
+            return bool(variants & pantry_keys)
+
+        for item in candidates:
+            recipe_ingredients = parse_items(item["row"].get(ingredients_col))
+            available, missing = [], []
+            for ingredient in recipe_ingredients:
+                (available if is_available(ingredient) else missing).append(ingredient)
+            total = len(recipe_ingredients)
+            coverage = len(available) / total if total else 0.0
+            item["available_ingredients"] = available
+            item["missing_ingredients"] = missing
+            item["ingredient_count"] = total
+            item["available_ingredient_count"] = len(available)
+            item["missing_ingredient_count"] = len(missing)
+            item["ingredient_coverage"] = coverage
+            item["final"] = 0.75 * item["relevance"] + 0.25 * coverage
 
         candidates.sort(key=lambda x: (x["final"], x["transform"], x["overlap"], x["tfidf"]), reverse=True)
 
@@ -2293,9 +2300,15 @@ def leftover_recommendations():
                     "recipe_name": item["name"],
                     "match_score": round(item["relevance"], 4),
                     "tfidf_score": round(item["tfidf"], 4),
-                    "ml_score": round(item["ml"], 4) if item["ml"] is not None else None,
+                    "ml_score": None,
                     "final_score": round(item["final"], 4),
                     "matched_ingredients": item["matched"],
+                    "available_ingredients": item["available_ingredients"],
+                    "missing_ingredients": item["missing_ingredients"],
+                    "ingredient_count": item["ingredient_count"],
+                    "available_ingredient_count": item["available_ingredient_count"],
+                    "missing_ingredient_count": item["missing_ingredient_count"],
+                    "ingredient_coverage_pct": round(item["ingredient_coverage"] * 100, 1),
                     "ingredients": parse_items(raw_ingredients),
                     "instructions": parse_items(raw_instructions),
                     "cuisine": clean(row.get(cuisine_col)) if cuisine_col else "",
@@ -2314,9 +2327,9 @@ def leftover_recommendations():
 
         return jsonify({
             "success": True,
-            "algorithm": "Ingredient relevance + leftover transformation priority + optional Mealora ML suitability",
+            "algorithm": "TF-IDF cosine similarity + ingredient overlap + pantry coverage + transformation ranking",
             "scoring_basis": "leftover ingredient and recipe reuse suitability only; no location/context scoring",
-            "ml_model_available": model is not None,
+            "ml_model_available": False,
             "recommendations": _json_safe(recommendations)
         })
 
